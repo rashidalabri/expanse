@@ -25,8 +25,7 @@ pub fn classify_in_repeat_read(bases: &[u8], quals: &[u8], motif_min_len: u32, m
         return None;
     }
 
-    let units = vec![unit.clone()];
-    let units_shifts = shift_units(&units);
+    let units_shifts = shift_units(std::slice::from_ref(&unit));
     let score = match_repeat_rc(&units_shifts, bases, quals) / bases.len() as f64;
 
     if score >= MIN_IRR_SCORE {
@@ -50,35 +49,29 @@ fn match_frequency_at_offset(offset: usize, bases: &[u8]) -> f64 {
         return 0.0;
     }
 
-    let num_matches = (0..bases.len() - offset).filter(|&position| bases[position] == bases[position + offset]).count();
     let max_matches = max_matches_at_offset(offset, bases);
+    let num_matches = bases[..max_matches].iter().zip(&bases[offset..]).filter(|(a, b)| a == b).count();
     num_matches as f64 / max_matches as f64
 }
 
 /// Finds the shortest motif period whose match frequency is at least as
 /// good as any longer period's, or `None` if none clears `min_frequency`.
 fn smallest_frequent_period(min_frequency: f64, bases: &[u8], motif_min_len: u32, motif_max_len: u32) -> Option<usize> {
-    let smallest_period = (motif_min_len.max(1)) as i64;
-    let largest_period = (motif_max_len as i64).min((bases.len() / 2 + 1) as i64);
+    let smallest_period = motif_min_len.max(1) as usize;
+    let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
 
     let mut max_match_frequency = min_frequency;
-    let mut best_offset: i64 = -1;
+    let mut best_period = None;
 
-    let mut offset = largest_period;
-    while offset + 1 != smallest_period {
-        let frequency = match_frequency_at_offset(offset as usize, bases);
+    for period in (smallest_period..=largest_period).rev() {
+        let frequency = match_frequency_at_offset(period, bases);
         if frequency >= max_match_frequency {
             max_match_frequency = frequency;
-            best_offset = offset;
+            best_period = Some(period);
         }
-        offset -= 1;
     }
 
-    if best_offset < 0 {
-        None
-    } else {
-        Some(best_offset as usize)
-    }
+    best_period
 }
 
 fn extract_consensus_base(offset: usize, period: usize, bases: &[u8]) -> u8 {
@@ -105,16 +98,11 @@ fn extract_consensus_repeat_unit(period: usize, bases: &[u8]) -> Vec<u8> {
 }
 
 fn minimal_unit_under_shift(unit: &[u8]) -> Vec<u8> {
-    let mut minimal = unit.to_vec();
+    let len = unit.len();
     let mut doubled = unit.to_vec();
     doubled.extend_from_slice(unit);
-    for index in 0..unit.len() {
-        let candidate = &doubled[index..index + unit.len()];
-        if candidate < minimal.as_slice() {
-            minimal = candidate.to_vec();
-        }
-    }
-    minimal
+    let best_offset = (0..len).min_by_key(|&offset| &doubled[offset..offset + len]).unwrap_or(0);
+    doubled[best_offset..best_offset + len].to_vec()
 }
 
 fn reverse_complement(bases: &[u8]) -> Vec<u8> {
@@ -185,37 +173,34 @@ fn match_units(units: &[Vec<u8>], bases: &[u8], quals: &[u8], min_baseq: u8) -> 
     const LOWQUAL_MISMATCH_SCORE: f64 = 0.5;
     const MISMATCH_PENALTY: f64 = -1.0;
 
-    let mut max_match_count = f64::NEG_INFINITY;
-    for unit in units {
-        let mut match_count = 0.0;
-        for i in 0..bases.len() {
-            if bases[i] == unit[i] {
-                match_count += MATCH_SCORE;
-            } else if quals[i] < min_baseq {
-                match_count += LOWQUAL_MISMATCH_SCORE;
-            } else {
-                match_count += MISMATCH_PENALTY;
-            }
-        }
-        if match_count > max_match_count {
-            max_match_count = match_count;
-        }
-    }
-    max_match_count
+    units
+        .iter()
+        .map(|unit| {
+            bases
+                .iter()
+                .zip(quals)
+                .zip(unit)
+                .map(|((&base, &qual), &unit_base)| {
+                    if base == unit_base {
+                        MATCH_SCORE
+                    } else if qual < min_baseq {
+                        LOWQUAL_MISMATCH_SCORE
+                    } else {
+                        MISMATCH_PENALTY
+                    }
+                })
+                .sum::<f64>()
+        })
+        .fold(f64::NEG_INFINITY, f64::max)
 }
 
 fn match_repeat(units: &[Vec<u8>], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
     let unit_len = units[0].len();
-    let mut score = 0.0;
-    let mut pos = 0;
-    while pos + unit_len <= bases.len() {
-        score += match_units(units, &bases[pos..pos + unit_len], &quals[pos..pos + unit_len], min_baseq);
-        pos += unit_len;
-    }
-    if pos != bases.len() {
-        score += match_units(units, &bases[pos..], &quals[pos..], min_baseq);
-    }
-    score
+    bases
+        .chunks(unit_len)
+        .zip(quals.chunks(unit_len))
+        .map(|(base_chunk, qual_chunk)| match_units(units, base_chunk, qual_chunk, min_baseq))
+        .sum()
 }
 
 fn match_repeat_with_shifts(units_shifts: &[Vec<Vec<u8>>], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
