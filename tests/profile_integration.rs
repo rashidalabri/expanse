@@ -52,8 +52,9 @@ fn scratch_path(name: &str) -> PathBuf {
 ///    inside the BED region; mate is high-mapq far away -> both should end
 ///    up in the output (pass 1 + pass 2).
 ///  - "pairB": both ends high-mapq inside the BED region -> excluded.
-///  - "pairC": read1 is low-mapq, IRR-classified, inside the BED region
-///    with an unmapped mate -> read1 included, no mate lookup performed.
+///  - "pairC": read1 is low-mapq, IRR-classified, inside the BED region,
+///    but its mate is unmapped -> excluded entirely in pass 1 (an IRR read
+///    with no mate to anchor it is never a candidate).
 ///  - "pairD": low-mapq, IRR-classified read1 entirely outside the BED
 ///    region -> never seen by pass 1 (region-restricted fetch), excluded.
 ///  - "pairE": read1 is low-mapq and inside the BED region, but its
@@ -147,10 +148,10 @@ fn profile_extracts_irr_reads_and_their_mates() {
         *counts.entry(qname.clone()).or_default() += 1;
     }
 
-    assert_eq!(written.len(), 3, "expected exactly 3 records, got {written:?}");
+    assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
     assert_eq!(counts.get("pairA"), Some(&2), "both pairA reads should be present");
-    assert_eq!(counts.get("pairC"), Some(&1), "pairC read1 should be present");
     assert!(!counts.contains_key("pairB"), "high-mapq pairB should be excluded");
+    assert!(!counts.contains_key("pairC"), "IRR read with an unmapped mate should be excluded entirely");
     assert!(!counts.contains_key("pairD"), "out-of-region pairD should be excluded");
     assert!(
         !counts.contains_key("pairE"),
