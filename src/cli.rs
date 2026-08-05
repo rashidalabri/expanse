@@ -5,6 +5,10 @@ use crate::commands::profile::ProfileArgs;
 #[derive(Parser, Debug)]
 #[command(name = "expanse", version, about = "Biobank-scale tandem repeat expansion screening")]
 pub struct Cli {
+    /// Increase logging verbosity (-v for debug, -vv for trace).
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Commands,
 }
