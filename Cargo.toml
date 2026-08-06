@@ -13,3 +13,10 @@ rust-htslib = { version = "1.0.1", features = ["s3", "gcs"] }
 [profile.release]
 codegen-units = 1
 lto = "fat"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "irr"
+harness = false
