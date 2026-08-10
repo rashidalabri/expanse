@@ -41,6 +41,11 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = 50)]
     pub min_anchor_mapq: u8,
 
+    /// Write every pass-1 IRR candidate as-is, skipping mate retrieval
+    /// (pass 2) and the passing-anchor requirement entirely.
+    #[arg(long)]
+    pub irr_only: bool,
+
     /// Reference FASTA. Required when the input or output uses CRAM.
     #[arg(short = 'r', long)]
     pub reference: Option<PathBuf>,
@@ -202,84 +207,99 @@ pub fn run(args: ProfileArgs) -> Result<()> {
                 candidate_records.push(record.clone());
             }
 
-            mate_targets.push(Region {
-                tid: record.mtid(),
-                start: record.mpos(),
-                end: record.mpos() + 1,
-            });
-            wanted_mates.insert((record.qname().to_vec(), !record.is_first_in_template()));
+            if !args.irr_only {
+                mate_targets.push(Region {
+                    tid: record.mtid(),
+                    start: record.mpos(),
+                    end: record.mpos() + 1,
+                });
+                wanted_mates.insert((record.qname().to_vec(), !record.is_first_in_template()));
+            }
         }
     }
-
-    let merged_mate_regions = bed::merge_regions(&mate_targets);
-    let mate_fetch_regions = match &crai_slices {
-        Some(slices) => bed::merge_regions(&crai::expand_to_slices(&merged_mate_regions, slices)),
-        None => merged_mate_regions.clone(),
-    };
 
     let mut written_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
     // Mate identities (qname, is_first_in_template) that were actually
     // found and passed --min-anchor-mapq, i.e. anchors the candidates above
-    // are allowed to keep.
+    // are allowed to keep. Left empty (and never consulted, since
+    // `args.irr_only` short-circuits the check below) when pass 2 is
+    // skipped entirely.
     let mut satisfied_mates: HashSet<(Vec<u8>, bool)> = HashSet::new();
 
+    let mut merged_mate_region_count = 0;
+    let mut mate_fetch_region_count = 0;
     let mut pass2_count: u64 = 0;
-    for region in &mate_fetch_regions {
-        reader
-            .fetch((region.tid, region.start, region.end))
-            .with_context(|| {
-                format!(
-                    "failed to seek to mate region tid={} {}-{}",
-                    region.tid, region.start, region.end
-                )
-            })?;
 
-        while let Some(result) = reader.read(&mut record) {
-            result.context("failed to read record in pass 2")?;
-
-            if crai_slices.is_some()
-                && !bed::contains(&merged_mate_regions, record.tid(), record.pos())
-            {
-                continue;
+    if !args.irr_only {
+        let merged_mate_regions = bed::merge_regions(&mate_targets);
+        let mate_fetch_regions = match &crai_slices {
+            Some(slices) => {
+                bed::merge_regions(&crai::expand_to_slices(&merged_mate_regions, slices))
             }
+            None => merged_mate_regions.clone(),
+        };
+        merged_mate_region_count = merged_mate_regions.len();
+        mate_fetch_region_count = mate_fetch_regions.len();
 
-            if record.is_secondary() || record.is_supplementary() {
-                continue;
-            }
-            if record.mapq() < args.min_anchor_mapq {
-                continue;
-            }
+        for region in &mate_fetch_regions {
+            reader
+                .fetch((region.tid, region.start, region.end))
+                .with_context(|| {
+                    format!(
+                        "failed to seek to mate region tid={} {}-{}",
+                        region.tid, region.start, region.end
+                    )
+                })?;
 
-            let mate_key = (record.qname().to_vec(), record.is_first_in_template());
-            if !wanted_mates.contains(&mate_key) {
-                continue;
-            }
+            while let Some(result) = reader.read(&mut record) {
+                result.context("failed to read record in pass 2")?;
 
-            satisfied_mates.insert(mate_key);
+                if crai_slices.is_some()
+                    && !bed::contains(&merged_mate_regions, record.tid(), record.pos())
+                {
+                    continue;
+                }
 
-            let key = (
-                record.tid(),
-                record.pos(),
-                record.qname().to_vec(),
-                record.flags(),
-            );
-            if written_keys.insert(key) {
-                writer
-                    .write(&record)
-                    .context("failed to write pass-2 mate record")?;
-                pass2_count += 1;
+                if record.is_secondary() || record.is_supplementary() {
+                    continue;
+                }
+                if record.mapq() < args.min_anchor_mapq {
+                    continue;
+                }
+
+                let mate_key = (record.qname().to_vec(), record.is_first_in_template());
+                if !wanted_mates.contains(&mate_key) {
+                    continue;
+                }
+
+                satisfied_mates.insert(mate_key);
+
+                let key = (
+                    record.tid(),
+                    record.pos(),
+                    record.qname().to_vec(),
+                    record.flags(),
+                );
+                if written_keys.insert(key) {
+                    writer
+                        .write(&record)
+                        .context("failed to write pass-2 mate record")?;
+                    pass2_count += 1;
+                }
             }
         }
     }
 
-    // Final step: drop IRR candidates whose mate was mapped but never made
-    // it into satisfied_mates (not found in its merged region, or found but
-    // below --min-anchor-mapq). Candidates with an unmapped mate never had
-    // an anchor to look for, so the filter doesn't apply to them.
+    // Final step: in the default two-pass mode, drop IRR candidates whose
+    // mate was mapped but never made it into satisfied_mates (not found in
+    // its merged region, or found but below --min-anchor-mapq); candidates
+    // with an unmapped mate never had an anchor to look for, so the filter
+    // doesn't apply to them. In --irr-only mode every candidate is written
+    // as-is, since pass 2 never ran and satisfied_mates is empty.
     let mut pass1_written_count: u64 = 0;
     let mut pass1_dropped_count: u64 = 0;
     for candidate in &candidate_records {
-        if !candidate.is_mate_unmapped() {
+        if !args.irr_only && !candidate.is_mate_unmapped() {
             let expected_mate_key = (
                 candidate.qname().to_vec(),
                 !candidate.is_first_in_template(),
@@ -304,17 +324,25 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         }
     }
 
-    log::info!(
-        "profile: {} region fetches ({} BED regions), {pass1_count} candidate IRR reads, \
-         {} merged mate regions ({} mate fetches), {pass2_count} mate reads written, \
-         {pass1_dropped_count} IRR reads dropped for lacking a passing anchor, {pass1_written_count} IRR reads written, \
-         {} total records written",
-        bed_fetch_regions.len(),
-        bed_regions.len(),
-        merged_mate_regions.len(),
-        mate_fetch_regions.len(),
-        written_keys.len(),
-    );
+    if args.irr_only {
+        log::info!(
+            "profile: {} region fetches ({} BED regions), {pass1_count} candidate IRR reads, \
+             {pass1_written_count} IRR reads written (--irr-only, pass 2 skipped)",
+            bed_fetch_regions.len(),
+            bed_regions.len(),
+        );
+    } else {
+        log::info!(
+            "profile: {} region fetches ({} BED regions), {pass1_count} candidate IRR reads, \
+             {merged_mate_region_count} merged mate regions ({mate_fetch_region_count} mate fetches), \
+             {pass2_count} mate reads written, \
+             {pass1_dropped_count} IRR reads dropped for lacking a passing anchor, {pass1_written_count} IRR reads written, \
+             {} total records written",
+            bed_fetch_regions.len(),
+            bed_regions.len(),
+            written_keys.len(),
+        );
+    }
 
     Ok(())
 }

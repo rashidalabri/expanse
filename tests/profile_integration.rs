@@ -185,6 +185,7 @@ fn profile_extracts_irr_reads_and_their_mates() {
         motif_min_len: 2,
         motif_max_len: 20,
         min_anchor_mapq: 50,
+        irr_only: false,
         reference: None,
         output_format: None,
         threads: 1,
@@ -220,6 +221,57 @@ fn profile_extracts_irr_reads_and_their_mates() {
     assert!(pair_a_flags.contains(&(PAIRED | READ2)));
 }
 
+/// With `--irr-only`, pass 2 (mate retrieval) never runs and the
+/// passing-anchor requirement is skipped: every pass-1 IRR candidate is
+/// written as-is, including pairF (whose mate is too low-mapq to count as
+/// an anchor, and so is dropped in the default two-pass mode).
+#[test]
+fn profile_irr_only_writes_candidates_without_mates() {
+    let (bam_path, bed_path) = build_fixture_bam();
+    let output_path = scratch_path("output_irr_only.bam");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        output: output_path.clone(),
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        min_anchor_mapq: 50,
+        irr_only: true,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let written = read_output_qnames(&output_path);
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (qname, _) in &written {
+        *counts.entry(qname.clone()).or_default() += 1;
+    }
+
+    assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
+    assert_eq!(counts.get("pairA"), Some(&1), "pairA's IRR read1 should be written, but not its mate");
+    assert_eq!(counts.get("pairF"), Some(&1), "pairF's IRR read1 should be written despite its low-mapq mate");
+    assert!(!counts.contains_key("pairB"), "high-mapq pairB should be excluded");
+    assert!(!counts.contains_key("pairC"), "IRR read with an unmapped mate should be excluded entirely");
+    assert!(!counts.contains_key("pairD"), "out-of-region pairD should be excluded");
+    assert!(
+        !counts.contains_key("pairE"),
+        "low-mapq but non-repetitive pairE should be excluded by the IRR purity filter"
+    );
+    assert!(!counts.contains_key("decoyX"), "decoy should never be pulled in");
+
+    let written_flags: Vec<u16> = written.iter().map(|(_, f)| *f).collect();
+    assert!(
+        written_flags.iter().all(|f| f & READ2 == 0),
+        "no mate (READ2) records should be written in --irr-only mode: {written:?}"
+    );
+}
+
 /// Same scenario as `profile_extracts_irr_reads_and_their_mates`, but against
 /// a CRAM input, exercising the CRAI-backed slice-merging fetch path (real
 /// `hopen`/`hread2` FFI reads of an htslib-built `.crai`, region expansion,
@@ -243,6 +295,7 @@ fn profile_extracts_irr_reads_and_their_mates_cram() {
         motif_min_len: 2,
         motif_max_len: 20,
         min_anchor_mapq: 50,
+        irr_only: false,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
         threads: 1,
