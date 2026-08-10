@@ -61,6 +61,18 @@ pub fn parse_bed(path: &Path, header: &HeaderView) -> Result<Vec<Region>> {
     Ok(regions)
 }
 
+/// Test whether `(tid, pos)` falls within one of `regions`, which must be
+/// sorted and non-overlapping per contig (i.e. the output of
+/// [`merge_regions`]).
+pub fn contains(regions: &[Region], tid: i32, pos: i64) -> bool {
+    let idx = regions.partition_point(|r| (r.tid, r.start) <= (tid, pos));
+    if idx == 0 {
+        return false;
+    }
+    let region = regions[idx - 1];
+    region.tid == tid && region.start <= pos && pos < region.end
+}
+
 /// Sort and merge overlapping/touching regions, per contig.
 pub fn merge_regions(regions: &[Region]) -> Vec<Region> {
     let mut sorted: Vec<Region> = regions.to_vec();
@@ -184,5 +196,21 @@ mod tests {
     fn merge_empty() {
         let merged = merge_regions(&[]);
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn contains_finds_pos_within_a_region() {
+        let regions = merge_regions(&[r(0, 10, 20), r(0, 30, 40), r(1, 5, 15)]);
+        assert!(contains(&regions, 0, 10));
+        assert!(contains(&regions, 0, 19));
+        assert!(contains(&regions, 1, 10));
+        assert!(!contains(&regions, 0, 20));
+        assert!(!contains(&regions, 0, 25));
+        assert!(!contains(&regions, 2, 10));
+    }
+
+    #[test]
+    fn contains_empty_regions_is_always_false() {
+        assert!(!contains(&[], 0, 10));
     }
 }

@@ -7,6 +7,7 @@ use rust_htslib::bam::{self, Format, Header, IndexedReader, Read as BamRead, Rec
 use url::Url;
 
 use crate::bed::{self, Region};
+use crate::crai;
 use crate::irr;
 
 #[derive(Args, Debug)]
@@ -96,6 +97,33 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         log::warn!("BED file {:?} contained no usable regions", args.bed);
     }
 
+    // For CRAM inputs, group regions by the underlying CRAM slice they land
+    // in so htslib only seeks/decompresses each slice once, rather than once
+    // per (possibly much narrower) BED/mate region. This can pull in extra
+    // reads that fall inside a shared slice but outside any originally
+    // requested region, so callers must re-check membership against the
+    // pre-expansion region set (via `bed::contains`) while iterating.
+    let crai_slices = if input_is_cram {
+        match crai::load(&args.input) {
+            Ok(slices) => Some(slices),
+            Err(err) => {
+                log::warn!(
+                    "failed to load CRAI slice index for {}, falling back to per-region fetch: {err:#}",
+                    args.input
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let bed_regions_merged = bed::merge_regions(&bed_regions);
+    let bed_fetch_regions = match &crai_slices {
+        Some(slices) => bed::merge_regions(&crai::expand_to_slices(&bed_regions, slices)),
+        None => bed_regions.clone(),
+    };
+
     let mut writer = bam::Writer::from_path(&args.output, &header, resolved_output_format)
         .with_context(|| format!("failed to open output {:?}", args.output))?;
     if resolved_output_format == Format::Cram
@@ -122,7 +150,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
     let mut pass1_count: u64 = 0;
     let mut record = Record::new();
-    for region in &bed_regions {
+    for region in &bed_fetch_regions {
         reader
             .fetch((region.tid, region.start, region.end))
             .with_context(|| {
@@ -134,6 +162,12 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
         while let Some(result) = reader.read(&mut record) {
             result.context("failed to read record in pass 1")?;
+
+            if crai_slices.is_some()
+                && !bed::contains(&bed_regions_merged, record.tid(), record.pos())
+            {
+                continue;
+            }
 
             if record.is_unmapped()
                 || record.is_secondary()
@@ -178,6 +212,10 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     }
 
     let merged_mate_regions = bed::merge_regions(&mate_targets);
+    let mate_fetch_regions = match &crai_slices {
+        Some(slices) => bed::merge_regions(&crai::expand_to_slices(&merged_mate_regions, slices)),
+        None => merged_mate_regions.clone(),
+    };
 
     let mut written_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
     // Mate identities (qname, is_first_in_template) that were actually
@@ -186,7 +224,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     let mut satisfied_mates: HashSet<(Vec<u8>, bool)> = HashSet::new();
 
     let mut pass2_count: u64 = 0;
-    for region in &merged_mate_regions {
+    for region in &mate_fetch_regions {
         reader
             .fetch((region.tid, region.start, region.end))
             .with_context(|| {
@@ -198,6 +236,12 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
         while let Some(result) = reader.read(&mut record) {
             result.context("failed to read record in pass 2")?;
+
+            if crai_slices.is_some()
+                && !bed::contains(&merged_mate_regions, record.tid(), record.pos())
+            {
+                continue;
+            }
 
             if record.is_secondary() || record.is_supplementary() {
                 continue;
@@ -261,10 +305,14 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     }
 
     log::info!(
-        "profile: {pass1_count} candidate IRR reads, {} merged mate regions, {pass2_count} mate reads written, \
+        "profile: {} region fetches ({} BED regions), {pass1_count} candidate IRR reads, \
+         {} merged mate regions ({} mate fetches), {pass2_count} mate reads written, \
          {pass1_dropped_count} IRR reads dropped for lacking a passing anchor, {pass1_written_count} IRR reads written, \
          {} total records written",
+        bed_fetch_regions.len(),
+        bed_regions.len(),
         merged_mate_regions.len(),
+        mate_fetch_regions.len(),
         written_keys.len(),
     );
 
