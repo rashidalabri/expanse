@@ -40,8 +40,18 @@ fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, mtid: i32,
     record
 }
 
+/// Each `#[test]` fn runs on its own dedicated thread under the default
+/// harness, so keying the scratch directory by thread id (in addition to
+/// process id) gives every test its own sandbox: fixture builders that
+/// reuse fixed names like "fixture.bam"/"fixture.bed" across several tests
+/// (e.g. relying on htslib's own path-based `.bai`/`.fai`/`.crai`
+/// conventions) can't race with each other when tests run in parallel.
 fn scratch_path(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("expanse-profile-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "expanse-profile-test-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }
@@ -185,6 +195,13 @@ fn profile_extracts_irr_reads_and_their_mates() {
         motif_min_len: 2,
         motif_max_len: 20,
         min_anchor_mapq: 50,
+        // pairA and pairF's anchors are each the only IRR supporting their
+        // own anchor cluster; min_irrs_per_anchor: 1 disables the new
+        // anchor-support filter so this test stays focused on the core
+        // two-pass mechanics (see profile_anchor_clustering_* below for that
+        // feature specifically).
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 1,
         irr_only: false,
         reference: None,
         output_format: None,
@@ -238,6 +255,8 @@ fn profile_irr_only_writes_candidates_without_mates() {
         motif_min_len: 2,
         motif_max_len: 20,
         min_anchor_mapq: 50,
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 2,
         irr_only: true,
         reference: None,
         output_format: None,
@@ -295,6 +314,8 @@ fn profile_extracts_irr_reads_and_their_mates_cram() {
         motif_min_len: 2,
         motif_max_len: 20,
         min_anchor_mapq: 50,
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 1,
         irr_only: false,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
@@ -329,4 +350,159 @@ fn profile_extracts_irr_reads_and_their_mates_cram() {
     let pair_a_flags: Vec<u16> = written.iter().filter(|(q, _)| q == "pairA").map(|(_, f)| *f).collect();
     assert!(pair_a_flags.contains(&(PAIRED | READ1)));
     assert!(pair_a_flags.contains(&(PAIRED | READ2)));
+}
+
+/// Builds a fixture (same header/BED as `build_fixture_bam`) with two IRR
+/// read pairs anchored close together (support one merged anchor region)
+/// and a third IRR read pair anchored far away, alone:
+///  - "clusterA_1" / "clusterA_2": read1s are low-mapq, IRR-classified,
+///    inside the BED region; their mates land at 3000 and 3050, 50bp apart
+///    (well within the default 1000bp `anchor_merge_distance`) -> the two
+///    mate locations merge into one anchor region backed by 2 IRR reads,
+///    meeting the default `min_irrs_per_anchor` of 2, so both pairs survive.
+///  - "clusterB_1": read1 is low-mapq, IRR-classified, inside the BED
+///    region, but its mate at 9000 is the only IRR supporting that anchor
+///    region -> below `min_irrs_per_anchor`, so the anchor region is
+///    dropped from pass 2 entirely and clusterB_1's read1 must never be
+///    written either.
+fn anchor_clustering_fixture_records() -> Vec<Record> {
+    let irr = irr_seq();
+    let filler = vec![b'A'; 50];
+
+    vec![
+        make_record("clusterA_1", 0, 60, 10, PAIRED | READ1, 0, 3000, &irr),
+        make_record("clusterA_2", 0, 65, 10, PAIRED | READ1, 0, 3050, &irr),
+        make_record("clusterB_1", 0, 70, 10, PAIRED | READ1, 0, 9000, &irr),
+        make_record("clusterA_1", 0, 3000, 60, PAIRED | READ2, 0, 60, &filler),
+        make_record("clusterA_2", 0, 3050, 60, PAIRED | READ2, 0, 65, &filler),
+        make_record("clusterB_1", 0, 9000, 60, PAIRED | READ2, 0, 70, &filler),
+    ]
+}
+
+fn build_anchor_clustering_fixture_bam() -> (PathBuf, PathBuf) {
+    let bam_path = scratch_path("anchor_clustering_fixture.bam");
+    let header = fixture_header();
+
+    {
+        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
+        for record in &anchor_clustering_fixture_records() {
+            writer.write(record).unwrap();
+        }
+    }
+
+    index::build(&bam_path, None, Type::Bai, 1).unwrap();
+
+    (bam_path, build_fixture_bed())
+}
+
+#[test]
+fn profile_anchor_clustering_keeps_well_supported_regions() {
+    let (bam_path, bed_path) = build_anchor_clustering_fixture_bam();
+    let output_path = scratch_path("output_anchor_clustering.bam");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        output: output_path.clone(),
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        min_anchor_mapq: 50,
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 2,
+        irr_only: false,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let written = read_output_qnames(&output_path);
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (qname, _) in &written {
+        *counts.entry(qname.clone()).or_default() += 1;
+    }
+
+    assert_eq!(written.len(), 4, "expected exactly 4 records, got {written:?}");
+    assert_eq!(counts.get("clusterA_1"), Some(&2), "clusterA_1's IRR read and mate should both be written");
+    assert_eq!(counts.get("clusterA_2"), Some(&2), "clusterA_2's IRR read and mate should both be written");
+    assert!(
+        !counts.contains_key("clusterB_1"),
+        "clusterB_1 is the lone IRR supporting its anchor region, below \
+         min_irrs_per_anchor, so its anchor region (and the read itself) \
+         must be dropped entirely: {written:?}"
+    );
+}
+
+/// Same fixture as `profile_anchor_clustering_keeps_well_supported_regions`,
+/// but with `min_irrs_per_anchor: 1`, which disables the anchor-support
+/// filter: all three IRR pairs (including the previously-dropped
+/// clusterB_1) should now survive.
+#[test]
+fn profile_anchor_clustering_min_irrs_of_one_keeps_everything() {
+    let (bam_path, bed_path) = build_anchor_clustering_fixture_bam();
+    let output_path = scratch_path("output_anchor_clustering_min1.bam");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        output: output_path.clone(),
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        min_anchor_mapq: 50,
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 1,
+        irr_only: false,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let written = read_output_qnames(&output_path);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (qname, _) in &written {
+        *counts.entry(qname.clone()).or_default() += 1;
+    }
+
+    assert_eq!(written.len(), 6, "expected exactly 6 records, got {written:?}");
+    assert_eq!(counts.get("clusterA_1"), Some(&2));
+    assert_eq!(counts.get("clusterA_2"), Some(&2));
+    assert_eq!(counts.get("clusterB_1"), Some(&2), "with min_irrs_per_anchor: 1, clusterB_1 should survive too");
+}
+
+/// Same well-supported-vs-lone-anchor fixture, but with
+/// `anchor_merge_distance: 40`, which is too short to merge clusterA_1's
+/// and clusterA_2's mate locations (3000 and 3050, 50bp apart) into one
+/// region: each then has only 1 IRR supporting it, so with the default
+/// `min_irrs_per_anchor: 2` both are dropped, alongside clusterB_1.
+#[test]
+fn profile_anchor_clustering_short_merge_distance_splits_clusters() {
+    let (bam_path, bed_path) = build_anchor_clustering_fixture_bam();
+    let output_path = scratch_path("output_anchor_clustering_short_distance.bam");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        output: output_path.clone(),
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        min_anchor_mapq: 50,
+        anchor_merge_distance: 40,
+        min_irrs_per_anchor: 2,
+        irr_only: false,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let written = read_output_qnames(&output_path);
+    assert!(written.is_empty(), "expected no records once clusterA is split apart by too-short a merge distance: {written:?}");
 }

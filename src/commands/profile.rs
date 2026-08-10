@@ -41,6 +41,17 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = 50)]
     pub min_anchor_mapq: u8,
 
+    /// Merge IRR anchor (mate) locations within this many bp of each other
+    /// into one anchor region before applying --min-irrs-per-anchor.
+    #[arg(long, default_value_t = 1000)]
+    pub anchor_merge_distance: i64,
+
+    /// Minimum number of distinct IRR candidates a merged anchor region
+    /// must have to be retrieved in pass 2. Anchor regions below this
+    /// threshold are discarded, along with their associated IRR candidates.
+    #[arg(long, default_value_t = 2)]
+    pub min_irrs_per_anchor: usize,
+
     /// Write every pass-1 IRR candidate as-is, skipping mate retrieval
     /// (pass 2) and the passing-anchor requirement entirely.
     #[arg(long)]
@@ -151,9 +162,6 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     // pass the anchor filter in pass 2 (see the final filtering step below).
     let mut candidate_records: Vec<Record> = Vec::new();
     let mut candidate_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
-    let mut mate_targets: Vec<Region> = Vec::new();
-    // (qname, is_first_in_template) identifying the specific mate we still need.
-    let mut wanted_mates: HashSet<(Vec<u8>, bool)> = HashSet::new();
 
     let mut pass1_count: u64 = 0;
     let mut record = Record::new();
@@ -208,15 +216,6 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             if candidate_keys.insert(key) {
                 candidate_records.push(record.clone());
             }
-
-            if !args.irr_only {
-                mate_targets.push(Region {
-                    tid: record.mtid(),
-                    start: record.mpos(),
-                    end: record.mpos() + 1,
-                });
-                wanted_mates.insert((record.qname().to_vec(), !record.is_first_in_template()));
-            }
         }
     }
 
@@ -228,12 +227,69 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     // skipped entirely.
     let mut satisfied_mates: HashSet<(Vec<u8>, bool)> = HashSet::new();
 
+    let mut anchor_cluster_count = 0;
+    let mut anchor_cluster_dropped_count = 0;
+    let mut anchor_dropped_irr_count: u64 = 0;
     let mut merged_mate_region_count = 0;
     let mut mate_fetch_region_count = 0;
     let mut pass2_count: u64 = 0;
 
     if !args.irr_only {
-        let merged_mate_regions = bed::merge_regions(&mate_targets);
+        // Cluster each candidate's mate location by proximity
+        // (--anchor-merge-distance) rather than just overlap/touching, then
+        // require --min-irrs-per-anchor distinct IRR candidates per cluster.
+        // Clusters (and their candidates) below that threshold are dropped
+        // before pass 2 ever looks for them.
+        let mate_targets: Vec<Region> = candidate_records
+            .iter()
+            .map(|candidate| Region {
+                tid: candidate.mtid(),
+                start: candidate.mpos(),
+                end: candidate.mpos() + 1,
+            })
+            .collect();
+
+        let anchor_clusters = bed::merge_within(&mate_targets, args.anchor_merge_distance);
+        anchor_cluster_count = anchor_clusters.len();
+
+        let candidate_cluster: Vec<usize> = mate_targets
+            .iter()
+            .map(|target| {
+                bed::locate(&anchor_clusters, target.tid, target.start)
+                    .expect("every mate target must fall within its own merged cluster")
+            })
+            .collect();
+        let mut cluster_irr_counts = vec![0usize; anchor_clusters.len()];
+        for &cluster_idx in &candidate_cluster {
+            cluster_irr_counts[cluster_idx] += 1;
+        }
+
+        let merged_mate_regions: Vec<Region> = anchor_clusters
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| cluster_irr_counts[*idx] >= args.min_irrs_per_anchor)
+            .map(|(_, region)| *region)
+            .collect();
+        anchor_cluster_dropped_count = anchor_cluster_count - merged_mate_regions.len();
+
+        // (qname, is_first_in_template) identifying the specific mate we
+        // still need; only populated for candidates whose anchor cluster
+        // survived the --min-irrs-per-anchor threshold above.
+        let mut wanted_mates: HashSet<(Vec<u8>, bool)> = HashSet::new();
+        let mut surviving_candidates = Vec::with_capacity(candidate_records.len());
+        for (candidate, cluster_idx) in candidate_records.into_iter().zip(candidate_cluster) {
+            if cluster_irr_counts[cluster_idx] >= args.min_irrs_per_anchor {
+                wanted_mates.insert((
+                    candidate.qname().to_vec(),
+                    !candidate.is_first_in_template(),
+                ));
+                surviving_candidates.push(candidate);
+            } else {
+                anchor_dropped_irr_count += 1;
+            }
+        }
+        candidate_records = surviving_candidates;
+
         let mate_fetch_regions = match &crai_slices {
             Some(slices) => bed::merge_regions(&crai::merge_by_slice(&merged_mate_regions, slices)),
             None => merged_mate_regions.clone(),
@@ -334,12 +390,15 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     } else {
         log::info!(
             "profile: {} region fetches ({} BED regions), {pass1_count} candidate IRR reads, \
-             {merged_mate_region_count} merged mate regions ({mate_fetch_region_count} mate fetches), \
+             {anchor_cluster_count} anchor clusters ({anchor_cluster_dropped_count} dropped for having \
+             fewer than {} IRR reads, taking {anchor_dropped_irr_count} IRR reads with them), \
+             {merged_mate_region_count} surviving anchor regions ({mate_fetch_region_count} mate fetches), \
              {pass2_count} mate reads written, \
              {pass1_dropped_count} IRR reads dropped for lacking a passing anchor, {pass1_written_count} IRR reads written, \
              {} total records written",
             bed_fetch_regions.len(),
             bed_regions.len(),
+            args.min_irrs_per_anchor,
             written_keys.len(),
         );
     }
