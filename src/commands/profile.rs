@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use rust_htslib::bam::{self, Format, Header, IndexedReader, Read as BamRead, Record};
+use serde::Serialize;
 use url::Url;
 
 use crate::bed::{self, Region};
@@ -57,6 +58,13 @@ pub struct ProfileArgs {
     #[arg(long)]
     pub irr_only: bool,
 
+    /// Write a JSON summary to this path: for each surviving merged anchor
+    /// region, its coordinates (0-based, half-open) and a breakdown of IRR
+    /// counts by motif. Has no effect with --irr-only, since anchor
+    /// clustering doesn't run in that mode.
+    #[arg(long)]
+    pub anchor_motif_summary: Option<PathBuf>,
+
     /// Reference FASTA. Required when the input or output uses CRAM.
     #[arg(short = 'r', long)]
     pub reference: Option<PathBuf>,
@@ -76,6 +84,19 @@ pub enum OutputFormat {
     Cram,
 }
 
+/// One entry in the `--anchor-motif-summary` JSON output: a merged anchor
+/// region that survived `--min-irrs-per-anchor`, with its IRR support
+/// broken down by (canonical) motif.
+#[derive(Serialize, Debug)]
+struct AnchorRegionSummary {
+    chrom: String,
+    /// 0-based, half-open, matching this crate's internal `Region` convention.
+    start: i64,
+    end: i64,
+    irr_count: usize,
+    motifs: BTreeMap<String, usize>,
+}
+
 pub fn run(args: ProfileArgs) -> Result<()> {
     let input_is_cram = is_cram_path(&args.input);
     let resolved_output_format = resolve_output_format(&args.output, args.output_format);
@@ -85,6 +106,12 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             "--reference is required when CRAM is involved (input={}, output={})",
             args.input,
             args.output.display()
+        );
+    }
+
+    if args.irr_only && args.anchor_motif_summary.is_some() {
+        log::warn!(
+            "--anchor-motif-summary has no effect with --irr-only (anchor clustering is skipped); no summary will be written"
         );
     }
 
@@ -161,6 +188,10 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     // whether each one is kept depends on whether its mate turns out to
     // pass the anchor filter in pass 2 (see the final filtering step below).
     let mut candidate_records: Vec<Record> = Vec::new();
+    // Each candidate's canonical motif, parallel to `candidate_records`
+    // (same length, same order) -- used to break IRR counts down by motif
+    // for `--anchor-motif-summary`.
+    let mut candidate_motifs: Vec<Vec<u8>> = Vec::new();
     let mut candidate_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
 
     let mut pass1_count: u64 = 0;
@@ -194,16 +225,14 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             if record.mapq() >= args.max_irr_mapq {
                 continue;
             }
-            if irr::classify_in_repeat_read(
+            let Some(motif) = irr::classify_in_repeat_read(
                 &record.seq().as_bytes(),
                 record.qual(),
                 args.motif_min_len,
                 args.motif_max_len,
-            )
-            .is_none()
-            {
+            ) else {
                 continue;
-            }
+            };
 
             pass1_count += 1;
 
@@ -215,6 +244,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             );
             if candidate_keys.insert(key) {
                 candidate_records.push(record.clone());
+                candidate_motifs.push(motif);
             }
         }
     }
@@ -260,17 +290,50 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             })
             .collect();
         let mut cluster_irr_counts = vec![0usize; anchor_clusters.len()];
-        for &cluster_idx in &candidate_cluster {
+        let mut cluster_motif_counts: Vec<HashMap<Vec<u8>, usize>> =
+            vec![HashMap::new(); anchor_clusters.len()];
+        for (&cluster_idx, motif) in candidate_cluster.iter().zip(candidate_motifs.iter()) {
             cluster_irr_counts[cluster_idx] += 1;
+            *cluster_motif_counts[cluster_idx]
+                .entry(motif.clone())
+                .or_insert(0) += 1;
         }
 
-        let merged_mate_regions: Vec<Region> = anchor_clusters
+        let surviving_cluster_indices: Vec<usize> = (0..anchor_clusters.len())
+            .filter(|&idx| cluster_irr_counts[idx] >= args.min_irrs_per_anchor)
+            .collect();
+        let merged_mate_regions: Vec<Region> = surviving_cluster_indices
             .iter()
-            .enumerate()
-            .filter(|(idx, _)| cluster_irr_counts[*idx] >= args.min_irrs_per_anchor)
-            .map(|(_, region)| *region)
+            .map(|&idx| anchor_clusters[idx])
             .collect();
         anchor_cluster_dropped_count = anchor_cluster_count - merged_mate_regions.len();
+
+        if let Some(summary_path) = &args.anchor_motif_summary {
+            let summaries: Vec<AnchorRegionSummary> = surviving_cluster_indices
+                .iter()
+                .map(|&idx| {
+                    let region = anchor_clusters[idx];
+                    let motifs: BTreeMap<String, usize> = cluster_motif_counts[idx]
+                        .iter()
+                        .map(|(motif, &count)| (String::from_utf8_lossy(motif).into_owned(), count))
+                        .collect();
+                    AnchorRegionSummary {
+                        chrom: String::from_utf8_lossy(reader.header().tid2name(region.tid as u32))
+                            .into_owned(),
+                        start: region.start,
+                        end: region.end,
+                        irr_count: cluster_irr_counts[idx],
+                        motifs,
+                    }
+                })
+                .collect();
+
+            let json = serde_json::to_string_pretty(&summaries)
+                .context("failed to serialize anchor motif summary")?;
+            std::fs::write(summary_path, json).with_context(|| {
+                format!("failed to write anchor motif summary {summary_path:?}")
+            })?;
+        }
 
         // (qname, is_first_in_template) identifying the specific mate we
         // still need; only populated for candidates whose anchor cluster

@@ -203,6 +203,7 @@ fn profile_extracts_irr_reads_and_their_mates() {
         anchor_merge_distance: 1000,
         min_irrs_per_anchor: 1,
         irr_only: false,
+        anchor_motif_summary: None,
         reference: None,
         output_format: None,
         threads: 1,
@@ -258,6 +259,7 @@ fn profile_irr_only_writes_candidates_without_mates() {
         anchor_merge_distance: 1000,
         min_irrs_per_anchor: 2,
         irr_only: true,
+        anchor_motif_summary: None,
         reference: None,
         output_format: None,
         threads: 1,
@@ -317,6 +319,7 @@ fn profile_extracts_irr_reads_and_their_mates_cram() {
         anchor_merge_distance: 1000,
         min_irrs_per_anchor: 1,
         irr_only: false,
+        anchor_motif_summary: None,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
         threads: 1,
@@ -411,6 +414,7 @@ fn profile_anchor_clustering_keeps_well_supported_regions() {
         anchor_merge_distance: 1000,
         min_irrs_per_anchor: 2,
         irr_only: false,
+        anchor_motif_summary: None,
         reference: None,
         output_format: None,
         threads: 1,
@@ -456,6 +460,7 @@ fn profile_anchor_clustering_min_irrs_of_one_keeps_everything() {
         anchor_merge_distance: 1000,
         min_irrs_per_anchor: 1,
         irr_only: false,
+        anchor_motif_summary: None,
         reference: None,
         output_format: None,
         threads: 1,
@@ -496,6 +501,7 @@ fn profile_anchor_clustering_short_merge_distance_splits_clusters() {
         anchor_merge_distance: 40,
         min_irrs_per_anchor: 2,
         irr_only: false,
+        anchor_motif_summary: None,
         reference: None,
         output_format: None,
         threads: 1,
@@ -505,4 +511,134 @@ fn profile_anchor_clustering_short_merge_distance_splits_clusters() {
 
     let written = read_output_qnames(&output_path);
     assert!(written.is_empty(), "expected no records once clusterA is split apart by too-short a merge distance: {written:?}");
+}
+
+/// A GATA-repeat read: passes the IRR purity filter with a different
+/// (4bp) motif than `irr_seq`'s CAG (3bp).
+fn gata_seq() -> Vec<u8> {
+    "GATA".repeat(15).into_bytes()
+}
+
+/// The canonical motif `expanse::irr::classify_in_repeat_read` assigns to
+/// `seq`, used so tests assert against the real canonicalization instead of
+/// a hardcoded (and possibly wrong) guess at its output.
+fn canonical_motif(seq: &[u8]) -> String {
+    let quals = vec![40u8; seq.len()];
+    let motif = expanse::irr::classify_in_repeat_read(seq, &quals, 2, 20)
+        .expect("fixture sequence should classify as an IRR");
+    String::from_utf8(motif).expect("motif should be ASCII bases")
+}
+
+/// Two IRR pairs with a CAG motif and one with a GATA motif, all anchored
+/// within 40bp of each other (well inside the default 1000bp
+/// `anchor_merge_distance`) so they merge into a single anchor region with
+/// 3 total IRRs split 2 (CAG) / 1 (GATA) across motifs.
+fn motif_summary_fixture_records() -> Vec<Record> {
+    let cag = irr_seq();
+    let gata = gata_seq();
+    let filler = vec![b'A'; 50];
+
+    vec![
+        make_record("motifA_1", 0, 60, 10, PAIRED | READ1, 0, 3000, &cag),
+        make_record("motifA_2", 0, 65, 10, PAIRED | READ1, 0, 3020, &cag),
+        make_record("motifB_1", 0, 70, 10, PAIRED | READ1, 0, 3040, &gata),
+        make_record("motifA_1", 0, 3000, 60, PAIRED | READ2, 0, 60, &filler),
+        make_record("motifA_2", 0, 3020, 60, PAIRED | READ2, 0, 65, &filler),
+        make_record("motifB_1", 0, 3040, 60, PAIRED | READ2, 0, 70, &filler),
+    ]
+}
+
+fn build_motif_summary_fixture_bam() -> (PathBuf, PathBuf) {
+    let bam_path = scratch_path("motif_summary_fixture.bam");
+    let header = fixture_header();
+
+    {
+        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
+        for record in &motif_summary_fixture_records() {
+            writer.write(record).unwrap();
+        }
+    }
+
+    index::build(&bam_path, None, Type::Bai, 1).unwrap();
+
+    (bam_path, build_fixture_bed())
+}
+
+#[test]
+fn profile_writes_anchor_motif_summary_json() {
+    let (bam_path, bed_path) = build_motif_summary_fixture_bam();
+    let output_path = scratch_path("output_motif_summary.bam");
+    let summary_path = scratch_path("anchor_motif_summary.json");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        output: output_path.clone(),
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        min_anchor_mapq: 50,
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 2,
+        irr_only: false,
+        anchor_motif_summary: Some(summary_path.clone()),
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let cag_motif = canonical_motif(&irr_seq());
+    let gata_motif = canonical_motif(&gata_seq());
+    assert_ne!(cag_motif, gata_motif, "fixture motifs should be distinct");
+
+    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(regions.len(), 1, "expected exactly one merged anchor region, got {summary:#}");
+    let region = &regions[0];
+
+    assert_eq!(region["chrom"], "chr1");
+    assert_eq!(region["start"], 3000);
+    assert_eq!(region["end"], 3041);
+    assert_eq!(region["irr_count"], 3);
+    assert_eq!(region["motifs"][&cag_motif], 2, "expected 2 CAG-motif IRRs: {summary:#}");
+    assert_eq!(region["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
+}
+
+/// With `--irr-only`, anchor clustering never runs, so
+/// `--anchor-motif-summary` has nothing to report; `profile::run` should
+/// still succeed (just logging a warning) rather than erroring, and no
+/// summary file should be written.
+#[test]
+fn profile_irr_only_skips_anchor_motif_summary() {
+    let (bam_path, bed_path) = build_motif_summary_fixture_bam();
+    let output_path = scratch_path("output_motif_summary_irr_only.bam");
+    let summary_path = scratch_path("anchor_motif_summary_irr_only.json");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        output: output_path.clone(),
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        min_anchor_mapq: 50,
+        anchor_merge_distance: 1000,
+        min_irrs_per_anchor: 2,
+        irr_only: true,
+        anchor_motif_summary: Some(summary_path.clone()),
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    assert!(
+        !summary_path.exists(),
+        "no summary file should be written in --irr-only mode"
+    );
 }

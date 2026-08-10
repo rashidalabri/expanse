@@ -485,6 +485,8 @@ dependencies = [
  "flate2",
  "log",
  "rust-htslib",
+ "serde",
+ "serde_json",
  "url",
 ]
 
