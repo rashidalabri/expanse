@@ -469,6 +469,7 @@ dependencies = [
  "env_logger",
  "log",
  "rust-htslib",
+ "url",
 ]
 
 [[package]]

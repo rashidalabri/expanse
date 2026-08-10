@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use rust_htslib::bam::{self, Format, Header, IndexedReader, Read as BamRead, Record};
+use url::Url;
 
 use crate::bed::{self, Region};
 use crate::irr;
@@ -70,8 +71,12 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         );
     }
 
-    let mut reader = IndexedReader::from_path(&args.input)
-        .with_context(|| format!("failed to open indexed input {}", args.input))?;
+    let mut reader = match Url::parse(&args.input) {
+        Ok(url) => IndexedReader::from_url(&url)
+            .with_context(|| format!("failed to open indexed input {}", args.input))?,
+        Err(_) => IndexedReader::from_path(&args.input)
+            .with_context(|| format!("failed to open indexed input {}", args.input))?,
+    };
     if let Some(reference) = &args.reference {
         reader
             .set_reference(reference)
