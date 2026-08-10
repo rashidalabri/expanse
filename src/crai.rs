@@ -6,6 +6,7 @@
 //! can group BED regions by the underlying CRAM slice they land in, and
 //! issue one `fetch()` per slice instead of one per region.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Read;
 use std::os::raw::c_void;
@@ -21,13 +22,17 @@ use crate::bed::Region;
 const MAX_CRAI_BYTES: usize = 512 * 1024 * 1024;
 
 /// One slice entry from a CRAI: the genomic span it covers (0-based,
-/// half-open) and its byte location, which we don't need beyond using it to
-/// identify distinct slices while parsing.
+/// half-open), plus its container/slice byte offsets, which together
+/// uniquely identify the physical slice (needed to tell two same-sized
+/// slices apart, and to keep multi-reference slices from being merged
+/// across contigs).
 #[derive(Debug, Clone, Copy)]
 pub struct Slice {
     pub tid: i32,
     pub start: i64,
     pub end: i64,
+    pub container_offset: u64,
+    pub slice_offset: u64,
 }
 
 /// Load and parse the CRAI index for `input` (a local path or s3:// / gs:// /
@@ -51,41 +56,59 @@ pub fn load(input: &str) -> Result<Vec<Slice>> {
     parse(&decompressed).with_context(|| format!("failed to parse CRAI index {idx_path}"))
 }
 
-/// Expand each region to the full span of every CRAM slice it overlaps.
-/// Regions that don't land on any known slice (e.g. an empty/stale index)
-/// are passed through unchanged, so callers always cover at least as much as
-/// the original region.
-pub fn expand_to_slices(regions: &[Region], slices: &[Slice]) -> Vec<Region> {
+/// Group `regions` by the CRAM slice(s) they overlap, and within each group
+/// merge the member regions into a single `[min(start), max(end))` span —
+/// i.e. the bounding box of the *regions themselves*, not the (generally
+/// wider) slice they happen to share. This still collapses same-slice
+/// regions into one `fetch()`, without pulling in the rest of the slice's
+/// genomic span.
+///
+/// A region overlapping multiple slices contributes to each of their
+/// groups, so it may appear in more than one output region. Regions that
+/// don't land on any known slice (e.g. an empty/stale index) are passed
+/// through unchanged, so callers always cover at least as much as the
+/// original region.
+pub fn merge_by_slice(regions: &[Region], slices: &[Slice]) -> Vec<Region> {
     let mut sorted: Vec<&Slice> = slices.iter().collect();
     sorted.sort_by_key(|s| (s.tid, s.start, s.end));
 
-    regions
-        .iter()
-        .flat_map(|region| {
-            let lo = sorted.partition_point(|s| s.tid < region.tid);
-            let hi = sorted.partition_point(|s| s.tid <= region.tid);
+    // Keyed by (tid, container_offset, slice_offset): the tid is redundant
+    // with the slice's own tid here (we only ever look at slices matching
+    // the region's tid), but keeping it in the key means a multi-reference
+    // slice's per-contig portions never get merged into one another.
+    let mut merged: HashMap<(i32, u64, u64), Region> = HashMap::new();
+    let mut unmatched: Vec<Region> = Vec::new();
 
-            let mut matches = Vec::new();
-            for slice in &sorted[lo..hi] {
-                if slice.start >= region.end {
-                    break;
-                }
-                if slice.end > region.start {
-                    matches.push(Region {
-                        tid: slice.tid,
-                        start: slice.start,
-                        end: slice.end,
-                    });
-                }
-            }
+    for region in regions {
+        let lo = sorted.partition_point(|s| s.tid < region.tid);
+        let hi = sorted.partition_point(|s| s.tid <= region.tid);
 
-            if matches.is_empty() {
-                vec![*region]
-            } else {
-                matches
+        let mut matched = false;
+        for slice in &sorted[lo..hi] {
+            if slice.start >= region.end {
+                break;
             }
-        })
-        .collect()
+            if slice.end > region.start {
+                matched = true;
+                let key = (slice.tid, slice.container_offset, slice.slice_offset);
+                merged
+                    .entry(key)
+                    .and_modify(|r| {
+                        r.start = r.start.min(region.start);
+                        r.end = r.end.max(region.end);
+                    })
+                    .or_insert(*region);
+            }
+        }
+
+        if !matched {
+            unmatched.push(*region);
+        }
+    }
+
+    let mut out: Vec<Region> = merged.into_values().collect();
+    out.extend(unmatched);
+    out
 }
 
 fn crai_path(input: &str) -> String {
@@ -117,8 +140,8 @@ fn parse(data: &[u8]) -> Result<Vec<Slice>> {
         let ref_id = next_i64("refID")?;
         let start = next_i64("start")?;
         let span = next_i64("span")?;
-        let _container_offset = next_i64("containerOffset")?;
-        let _slice_offset = next_i64("sliceOffset")?;
+        let container_offset = next_i64("containerOffset")?;
+        let slice_offset = next_i64("sliceOffset")?;
         let _slice_size = next_i64("sliceSize")?;
 
         // Unmapped-reads-only slices (refID == -1) never overlap a BED
@@ -133,6 +156,8 @@ fn parse(data: &[u8]) -> Result<Vec<Slice>> {
             // convention used by `Region` elsewhere in this crate.
             start: start - 1,
             end: start - 1 + span,
+            container_offset: container_offset as u64,
+            slice_offset: slice_offset as u64,
         });
     }
 
@@ -209,12 +234,23 @@ unsafe fn hread(fp: *mut htslib::hFILE, buf: &mut [u8]) -> Result<usize> {
 mod tests {
     use super::*;
 
-    fn s(tid: i32, start: i64, end: i64) -> Slice {
-        Slice { tid, start, end }
+    fn s(tid: i32, start: i64, end: i64, container_offset: u64, slice_offset: u64) -> Slice {
+        Slice {
+            tid,
+            start,
+            end,
+            container_offset,
+            slice_offset,
+        }
     }
 
     fn r(tid: i32, start: i64, end: i64) -> Region {
         Region { tid, start, end }
+    }
+
+    fn sorted(mut regions: Vec<Region>) -> Vec<Region> {
+        regions.sort_by_key(|r| (r.tid, r.start, r.end));
+        regions
     }
 
     #[test]
@@ -234,9 +270,13 @@ mod tests {
         assert_eq!(
             slices
                 .iter()
-                .map(|s| (s.tid, s.start, s.end))
+                .map(|s| (s.tid, s.start, s.end, s.container_offset, s.slice_offset))
                 .collect::<Vec<_>>(),
-            vec![(0, 0, 100), (0, 100, 150), (1, 0, 10)]
+            vec![
+                (0, 0, 100, 0, 0),
+                (0, 100, 150, 1000, 0),
+                (1, 0, 10, 2000, 0),
+            ]
         );
     }
 
@@ -248,25 +288,59 @@ mod tests {
     }
 
     #[test]
-    fn expand_to_slices_replaces_region_with_overlapping_slice_spans() {
-        let slices = vec![s(0, 0, 100), s(0, 100, 200), s(1, 0, 50)];
-        let regions = vec![r(0, 10, 20), r(0, 90, 110)];
-        let expanded = expand_to_slices(&regions, &slices);
-        assert_eq!(expanded, vec![r(0, 0, 100), r(0, 0, 100), r(0, 100, 200)]);
+    fn merge_by_slice_merges_regions_sharing_a_slice_to_their_own_bounds() {
+        // A single wide slice; two regions land in it, well inside its
+        // boundaries. The merged region must be bounded by the *regions*
+        // (10..600), not the slice's own (much wider) 0..1000 span.
+        let slices = vec![s(0, 0, 1000, 100, 0)];
+        let regions = vec![r(0, 10, 20), r(0, 500, 600)];
+        let merged = merge_by_slice(&regions, &slices);
+        assert_eq!(merged, vec![r(0, 10, 600)]);
     }
 
     #[test]
-    fn expand_to_slices_falls_back_to_original_region_when_unmatched() {
-        let slices = vec![s(0, 0, 100)];
+    fn merge_by_slice_keeps_distinct_slices_separate() {
+        let slices = vec![s(0, 0, 100, 100, 0), s(0, 100, 200, 200, 0)];
+        let regions = vec![r(0, 10, 20), r(0, 110, 120)];
+        let merged = sorted(merge_by_slice(&regions, &slices));
+        assert_eq!(merged, vec![r(0, 10, 20), r(0, 110, 120)]);
+    }
+
+    #[test]
+    fn merge_by_slice_region_spanning_two_slices_contributes_to_both_groups() {
+        // Two adjacent, distinct slices (same container, different slice
+        // offset). `r(0, 40, 60)` overlaps both, so it should be folded
+        // into both groups' bounds, while `r(0, 10, 20)` only touches the
+        // first.
+        let slices = vec![s(0, 0, 50, 100, 0), s(0, 50, 100, 100, 1)];
+        let regions = vec![r(0, 10, 20), r(0, 40, 60)];
+        let merged = sorted(merge_by_slice(&regions, &slices));
+        assert_eq!(merged, vec![r(0, 10, 60), r(0, 40, 60)]);
+    }
+
+    #[test]
+    fn merge_by_slice_does_not_merge_across_tids_sharing_a_slice_offset() {
+        // Simulates a multi-reference slice: same container/slice offset,
+        // but two different tids. Regions on different contigs must never
+        // be merged into a single (single-tid) Region.
+        let slices = vec![s(0, 0, 100, 100, 0), s(1, 0, 100, 100, 0)];
+        let regions = vec![r(0, 10, 20), r(1, 30, 40)];
+        let merged = sorted(merge_by_slice(&regions, &slices));
+        assert_eq!(merged, vec![r(0, 10, 20), r(1, 30, 40)]);
+    }
+
+    #[test]
+    fn merge_by_slice_falls_back_to_original_region_when_unmatched() {
+        let slices = vec![s(0, 0, 100, 100, 0)];
         let regions = vec![r(1, 10, 20)];
-        let expanded = expand_to_slices(&regions, &slices);
-        assert_eq!(expanded, vec![r(1, 10, 20)]);
+        let merged = merge_by_slice(&regions, &slices);
+        assert_eq!(merged, vec![r(1, 10, 20)]);
     }
 
     #[test]
-    fn expand_to_slices_empty_index_is_noop() {
+    fn merge_by_slice_empty_index_is_noop() {
         let regions = vec![r(0, 10, 20), r(1, 5, 15)];
-        let expanded = expand_to_slices(&regions, &[]);
-        assert_eq!(expanded, regions);
+        let merged = merge_by_slice(&regions, &[]);
+        assert_eq!(merged, regions);
     }
 }

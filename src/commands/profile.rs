@@ -103,11 +103,13 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     }
 
     // For CRAM inputs, group regions by the underlying CRAM slice they land
-    // in so htslib only seeks/decompresses each slice once, rather than once
-    // per (possibly much narrower) BED/mate region. This can pull in extra
-    // reads that fall inside a shared slice but outside any originally
-    // requested region, so callers must re-check membership against the
-    // pre-expansion region set (via `bed::contains`) while iterating.
+    // in and merge each group down to the bounding box of its own member
+    // regions (not the slice's own, generally wider, span), so htslib only
+    // seeks/decompresses each slice once rather than once per (possibly much
+    // narrower) BED/mate region. A group can still cover a gap between its
+    // members that no original region touches, so callers must re-check
+    // membership against the pre-merge region set (via `bed::contains`)
+    // while iterating.
     let crai_slices = if input_is_cram {
         match crai::load(&args.input) {
             Ok(slices) => Some(slices),
@@ -125,7 +127,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
     let bed_regions_merged = bed::merge_regions(&bed_regions);
     let bed_fetch_regions = match &crai_slices {
-        Some(slices) => bed::merge_regions(&crai::expand_to_slices(&bed_regions, slices)),
+        Some(slices) => bed::merge_regions(&crai::merge_by_slice(&bed_regions, slices)),
         None => bed_regions.clone(),
     };
 
@@ -233,9 +235,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     if !args.irr_only {
         let merged_mate_regions = bed::merge_regions(&mate_targets);
         let mate_fetch_regions = match &crai_slices {
-            Some(slices) => {
-                bed::merge_regions(&crai::expand_to_slices(&merged_mate_regions, slices))
-            }
+            Some(slices) => bed::merge_regions(&crai::merge_by_slice(&merged_mate_regions, slices)),
             None => merged_mate_regions.clone(),
         };
         merged_mate_region_count = merged_mate_regions.len();
