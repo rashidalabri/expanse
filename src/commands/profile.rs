@@ -9,6 +9,7 @@ use url::Url;
 
 use crate::bed::{self, Region};
 use crate::crai;
+use crate::hts_io::is_cram_path;
 use crate::irr;
 
 #[derive(Args, Debug)]
@@ -469,11 +470,6 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     Ok(())
 }
 
-fn is_cram_path(path: &str) -> bool {
-    let path_no_query = path.split(['?', '#']).next().unwrap_or(path);
-    path_no_query.to_ascii_lowercase().ends_with(".cram")
-}
-
 fn resolve_output_format(output: &Path, override_format: Option<OutputFormat>) -> Format {
     match override_format {
         Some(OutputFormat::Bam) => Format::Bam,
@@ -496,15 +492,6 @@ fn resolve_output_format(output: &Path, override_format: Option<OutputFormat>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_cram_path_detects_extension_case_insensitively() {
-        assert!(is_cram_path("foo.cram"));
-        assert!(is_cram_path("foo.CRAM"));
-        assert!(is_cram_path("s3://bucket/foo.cram"));
-        assert!(is_cram_path("s3://bucket/foo.cram?X-Amz-Signature=abc"));
-        assert!(!is_cram_path("foo.bam"));
-    }
 
     #[test]
     fn resolve_output_format_infers_from_extension() {

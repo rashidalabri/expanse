@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+use crate::commands::find_sinks::FindSinksArgs;
 use crate::commands::profile::ProfileArgs;
 
 #[derive(Parser, Debug)]
@@ -18,4 +19,9 @@ pub enum Commands {
     /// Extract IRR (in-repeat-read) evidence and their mates from a CRAM/BAM
     /// into a small output CRAM/BAM for downstream repeat-expansion calling.
     Profile(ProfileArgs),
+
+    /// Scan an entire CRAM/BAM/SAM front-to-back (no index required) for
+    /// in-repeat reads (IRRs), and write a BED of the "sink" regions they
+    /// cluster into.
+    FindSinks(FindSinksArgs),
 }
