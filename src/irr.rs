@@ -6,7 +6,14 @@
 //! `K`, `M`, `B`, `D`, `H`, `V`, `N`) at positions that are consistently
 //! mixed across repeat copies rather than a single fixed base -- e.g. `GCN`
 //! (an unconstrained 3rd position) or `AARRG` (two purine-only positions).
-//! See [`extract_consensus_base_iupac`] for how a position is called degenerate.
+//! See [`extract_consensus_base_iupac`] for how a position is called
+//! degenerate, and [`degenerate_count`] for the per-motif cap callers place
+//! on how many positions may be degenerate before a motif is rejected
+//! outright -- separately configurable for mononucleotide, dinucleotide,
+//! trinucleotide, and longer motifs (see `max_degenerate_mononucleotide`
+//! /`max_degenerate_dinucleotide`/`max_degenerate_trinucleotide`
+//! /`max_degenerate_other` on
+//! [`classify_in_repeat_read`]/[`classify_in_repeat_read_all`]).
 //!
 //! `bases` are expected to be uppercase decoded read sequence bytes (as
 //! returned by `rust_htslib::bam::record::Seq::as_bytes`), and `quals` are
@@ -69,14 +76,71 @@ fn iupac_matches(observed: u8, code: u8) -> bool {
 pub const DEFAULT_MOTIF_MIN_LEN: u32 = 2;
 /// Default longest repeat-unit (motif) length to consider.
 pub const DEFAULT_MOTIF_MAX_LEN: u32 = 20;
+/// Default degenerate-position cap for a mononucleotide (1bp) motif.
+pub const DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE: u32 = 0;
+/// Default degenerate-position cap for a dinucleotide (2bp) motif.
+pub const DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE: u32 = 0;
+/// Default degenerate-position cap for a trinucleotide (3bp) motif.
+pub const DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE: u32 = 1;
+/// Default degenerate-position cap for any motif of 4bp or longer.
+pub const DEFAULT_MAX_DEGENERATE_OTHER: u32 = 2;
+
+/// The number of `unit`'s positions that are an IUPAC ambiguity code
+/// rather than a plain A/C/G/T base.
+fn degenerate_count(unit: &[u8]) -> u32 {
+    unit.iter().filter(|&&b| !matches!(b, b'A' | b'C' | b'G' | b'T')).count() as u32
+}
+
+/// Does `unit` have more degenerate positions than allowed for its length?
+/// Mononucleotide (1bp), dinucleotide (2bp), and trinucleotide (3bp)
+/// motifs are short enough that even one or two degenerate positions
+/// dominate the whole motif, so each gets its own, stricter cap; every
+/// motif of 4bp or longer shares `max_other`.
+fn exceeds_degenerate_limit(
+    unit: &[u8],
+    max_mononucleotide: u32,
+    max_dinucleotide: u32,
+    max_trinucleotide: u32,
+    max_other: u32,
+) -> bool {
+    let limit = match unit.len() {
+        1 => max_mononucleotide,
+        2 => max_dinucleotide,
+        3 => max_trinucleotide,
+        _ => max_other,
+    };
+    degenerate_count(unit) > limit
+}
 
 /// Returns the canonical repeat unit if `bases` (paired with `quals`) look
 /// like an in-repeat read, `None` otherwise. The unit may contain IUPAC
-/// ambiguity codes at consistently-mixed positions (see the module docs).
-pub fn classify_in_repeat_read(bases: &[u8], quals: &[u8], motif_min_len: u32, motif_max_len: u32) -> Option<Vec<u8>> {
+/// ambiguity codes at consistently-mixed positions (see the module docs),
+/// but is rejected if it has more degenerate positions than
+/// `max_degenerate_mononucleotide`/`max_degenerate_dinucleotide`/
+/// `max_degenerate_trinucleotide`/`max_degenerate_other` allow for its
+/// length (see [`exceeds_degenerate_limit`]).
+#[allow(clippy::too_many_arguments)]
+pub fn classify_in_repeat_read(
+    bases: &[u8],
+    quals: &[u8],
+    motif_min_len: u32,
+    motif_max_len: u32,
+    max_degenerate_mononucleotide: u32,
+    max_degenerate_dinucleotide: u32,
+    max_degenerate_trinucleotide: u32,
+    max_degenerate_other: u32,
+) -> Option<Vec<u8>> {
     let unit =
         compute_canonical_repeat_unit_with_frequency(MIN_UNIT_FREQUENCY, bases, quals, motif_min_len, motif_max_len)?;
-    if unit.is_empty() || unit.iter().all(|&b| b == b'N') {
+    if unit.is_empty()
+        || exceeds_degenerate_limit(
+            &unit,
+            max_degenerate_mononucleotide,
+            max_degenerate_dinucleotide,
+            max_degenerate_trinucleotide,
+            max_degenerate_other,
+        )
+    {
         return None;
     }
 
@@ -97,12 +161,21 @@ pub fn classify_in_repeat_read(bases: &[u8], quals: &[u8], motif_min_len: u32, m
 /// unlike [`classify_in_repeat_read`] this doesn't collapse to a single
 /// "best" motif. Each returned motif is distinct; order is not significant.
 /// A motif may contain IUPAC ambiguity codes at consistently-mixed
-/// positions (see the module docs).
+/// positions (see the module docs), but is excluded if it has more
+/// degenerate positions than `max_degenerate_mononucleotide`/
+/// `max_degenerate_dinucleotide`/`max_degenerate_trinucleotide`/
+/// `max_degenerate_other` allow for its length (see
+/// [`exceeds_degenerate_limit`]).
+#[allow(clippy::too_many_arguments)]
 pub fn classify_in_repeat_read_all(
     bases: &[u8],
     quals: &[u8],
     motif_min_len: u32,
     motif_max_len: u32,
+    max_degenerate_mononucleotide: u32,
+    max_degenerate_dinucleotide: u32,
+    max_degenerate_trinucleotide: u32,
+    max_degenerate_other: u32,
 ) -> Vec<Vec<u8>> {
     let smallest_period = motif_min_len.max(1) as usize;
     let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
@@ -125,7 +198,16 @@ pub fn classify_in_repeat_read_all(
         }
 
         let canonical = compute_canonical_repeat_unit(&unit);
-        if canonical.is_empty() || canonical.iter().all(|&b| b == b'N') || motifs.contains(&canonical) {
+        if canonical.is_empty()
+            || exceeds_degenerate_limit(
+                &canonical,
+                max_degenerate_mononucleotide,
+                max_degenerate_dinucleotide,
+                max_degenerate_trinucleotide,
+                max_degenerate_other,
+            )
+            || motifs.contains(&canonical)
+        {
             continue;
         }
 
@@ -406,6 +488,36 @@ mod tests {
         ascii.bytes().map(|c| c - 33).collect()
     }
 
+    /// `classify_in_repeat_read` at the default degenerate-position caps,
+    /// for tests that don't care about that parameter specifically.
+    fn classify_default(bases: &[u8], quals: &[u8], motif_min_len: u32, motif_max_len: u32) -> Option<Vec<u8>> {
+        classify_in_repeat_read(
+            bases,
+            quals,
+            motif_min_len,
+            motif_max_len,
+            DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_OTHER,
+        )
+    }
+
+    /// `classify_in_repeat_read_all` at the default degenerate-position
+    /// caps, for tests that don't care about that parameter specifically.
+    fn classify_all_default(bases: &[u8], quals: &[u8], motif_min_len: u32, motif_max_len: u32) -> Vec<Vec<u8>> {
+        classify_in_repeat_read_all(
+            bases,
+            quals,
+            motif_min_len,
+            motif_max_len,
+            DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_OTHER,
+        )
+    }
+
     #[test]
     fn max_matches_at_offset_various() {
         let bases = b"ATCGATCG";
@@ -510,14 +622,11 @@ mod tests {
     #[test]
     fn classify_in_repeat_read_typical_cases() {
         assert_eq!(
-            classify_in_repeat_read(b"CCCCC", &raw_quals("$$$$$"), 1, 20),
+            classify_default(b"CCCCC", &raw_quals("$$$$$"), 1, 20),
             Some(b"C".to_vec())
         );
 
-        assert_eq!(
-            classify_in_repeat_read(b"AAAAACCCCC", &raw_quals("$$$$$$$$$$"), 1, 20),
-            None
-        );
+        assert_eq!(classify_default(b"AAAAACCCCC", &raw_quals("$$$$$$$$$$"), 1, 20), None);
 
         let bases: &[u8] = concat!(
             "TCCACCCACCTCACCCCCCCCCCCCCCCGCCCCCCCCCCACCCCCCCCGCCCCCCCCCCCGGCCCCCCACTCCCCCCCCCCGGTCCTCCCC",
@@ -528,7 +637,7 @@ mod tests {
             "------7----7-----7-777-7-F<--777F777F<J-7--7-7-A7-AFJA<<A-<<-7--7A77---7A-77A77A7---7-7-",
             "7--77-7-77-777---7<7A<A-7A)-)-<)7))77A<JJF))--A<F-)-<-)<---7<J"
         ));
-        assert_eq!(classify_in_repeat_read(bases, &quals, 1, 70), None);
+        assert_eq!(classify_default(bases, &quals, 1, 70), None);
 
         let bases: &[u8] = concat!(
             "TCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTT",
@@ -539,7 +648,7 @@ mod tests {
             "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
             "(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((("
         ));
-        assert_eq!(classify_in_repeat_read(bases, &quals, 1, 20), Some(b"AAATG".to_vec()));
+        assert_eq!(classify_default(bases, &quals, 1, 20), Some(b"AAATG".to_vec()));
 
         let bases: &[u8] = concat!(
             "CCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCCCGCCCCGCC",
@@ -550,7 +659,7 @@ mod tests {
             "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
             "(((((((((((((((((((((((((((((((((((((((((((((((((((((((("
         ));
-        assert_eq!(classify_in_repeat_read(bases, &quals, 1, 15), Some(b"CCCCGCCCCGCG".to_vec()));
+        assert_eq!(classify_default(bases, &quals, 1, 15), Some(b"CCCCGCCCCGCG".to_vec()));
 
         let bases: &[u8] = concat!(
             "GGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCG",
@@ -561,12 +670,12 @@ mod tests {
             "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
             "(((((((((((((((((((((((((((((((((((((((((((((((((((((((("
         ));
-        assert_eq!(classify_in_repeat_read(bases, &quals, 1, 20), Some(b"CCCCGCCCCGCG".to_vec()));
+        assert_eq!(classify_default(bases, &quals, 1, 20), Some(b"CCCCGCCCCGCG".to_vec()));
     }
 
     #[test]
     fn classify_in_repeat_read_rejects_n_bases() {
-        assert_eq!(classify_in_repeat_read(b"NNNNN", &raw_quals("$$$$$"), 1, 20), None);
+        assert_eq!(classify_default(b"NNNNN", &raw_quals("$$$$$"), 1, 20), None);
     }
 
     /// A read whose composition is 20 A's followed by a single G, repeated:
@@ -585,14 +694,14 @@ mod tests {
     fn classify_in_repeat_read_all_returns_single_motif_for_pure_repeat() {
         let bases = "CAG".repeat(20).into_bytes();
         let quals = vec![40u8; bases.len()];
-        assert_eq!(classify_in_repeat_read_all(&bases, &quals, 1, 20), vec![b"AGC".to_vec()]);
+        assert_eq!(classify_all_default(&bases, &quals, 1, 20), vec![b"AGC".to_vec()]);
     }
 
     #[test]
     fn classify_in_repeat_read_all_returns_empty_for_non_repetitive() {
         let bases = b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA";
         let quals = vec![40u8; bases.len()];
-        assert!(classify_in_repeat_read_all(bases, &quals, 1, 20).is_empty());
+        assert!(classify_all_default(bases, &quals, 1, 20).is_empty());
     }
 
     #[test]
@@ -600,7 +709,7 @@ mod tests {
         let bases = mostly_a_with_rare_g();
         let quals = vec![40u8; bases.len()];
 
-        let motifs = classify_in_repeat_read_all(&bases, &quals, 1, 30);
+        let motifs = classify_all_default(&bases, &quals, 1, 30);
 
         assert!(
             motifs.contains(&b"A".to_vec()),
@@ -619,7 +728,7 @@ mod tests {
         // above are among whatever comes back.
 
         // The single-motif classifier only ever returns one of them.
-        let single = classify_in_repeat_read(&bases, &quals, 1, 30);
+        let single = classify_default(&bases, &quals, 1, 30);
         assert!(single.is_some());
         assert!(motifs.contains(single.as_ref().unwrap()));
     }
@@ -754,5 +863,95 @@ mod tests {
         let quals = vec![40u8; bases.len()];
 
         assert_eq!(extract_consensus_repeat_unit_iupac(5, &bases, &quals), b"AARRG");
+    }
+
+    #[test]
+    fn degenerate_count_basic() {
+        assert_eq!(degenerate_count(b"AAATG"), 0);
+        assert_eq!(degenerate_count(b"GCN"), 1);
+        assert_eq!(degenerate_count(b"AARRG"), 2);
+        assert_eq!(degenerate_count(b"NNNN"), 4);
+    }
+
+    #[test]
+    fn exceeds_degenerate_limit_uses_length_specific_defaults() {
+        let defaults = |unit: &[u8]| {
+            exceeds_degenerate_limit(
+                unit,
+                DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+                DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+                DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+                DEFAULT_MAX_DEGENERATE_OTHER,
+            )
+        };
+
+        // Mononucleotide (1bp): default cap 0.
+        assert!(!defaults(b"A"), "a clean mononucleotide motif should never be rejected");
+        assert!(defaults(b"N"), "any degenerate position should exceed the mononucleotide default of 0");
+
+        // Dinucleotide (2bp): default cap 0.
+        assert!(!defaults(b"AC"), "a clean dinucleotide motif should never be rejected");
+        assert!(defaults(b"AR"), "any degenerate position should exceed the dinucleotide default of 0");
+
+        // Trinucleotide (3bp): default cap 1.
+        assert!(!defaults(b"GCN"), "one degenerate position should be within the trinucleotide default of 1");
+        assert!(defaults(b"RCN"), "two degenerate positions should exceed the trinucleotide default of 1");
+
+        // Everything else (4bp+): default cap 2.
+        assert!(!defaults(b"AARRG"), "two degenerate positions should be within the \"other\" default of 2");
+        assert!(defaults(b"ARRRG"), "three degenerate positions should exceed the \"other\" default of 2");
+    }
+
+    /// An 8bp unit: 5 fixed A's, then 3 positions that mix evenly (10/10)
+    /// between A and G, cycling copy-to-copy through an `AAGG` pattern
+    /// (period 4 in copy-index, i.e. not aligned with the target period-8
+    /// grouping) -- keeping the raw literal periodicity signal strong
+    /// enough to be found (5/8 positions always match exactly, and the
+    /// 3 mixed positions still match at the adjacent-copy lag about half
+    /// the time) while pushing the resulting unit's degenerate count (3)
+    /// just over the default "other" cap of 2.
+    fn mostly_pure_with_three_mixed_positions() -> Vec<u8> {
+        let purine_cycle = [b'A', b'A', b'G', b'G'];
+        (0..20usize)
+            .flat_map(|i| {
+                let p = purine_cycle[i % 4];
+                [b'A', b'A', b'A', b'A', b'A', p, p, p]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn classify_in_repeat_read_all_rejects_motif_over_default_degenerate_limit() {
+        let bases = mostly_pure_with_three_mixed_positions();
+        let quals = vec![40u8; bases.len()];
+
+        let motifs = classify_all_default(&bases, &quals, 2, 10);
+        assert!(
+            !motifs.iter().any(|m| m.len() == 8),
+            "an 8bp motif with 3 degenerate positions should be rejected at the default \
+             \"other\" cap of 2: {motifs:?}"
+        );
+    }
+
+    #[test]
+    fn classify_in_repeat_read_all_allows_motif_under_relaxed_degenerate_limit() {
+        let bases = mostly_pure_with_three_mixed_positions();
+        let quals = vec![40u8; bases.len()];
+
+        let motifs = classify_in_repeat_read_all(
+            &bases,
+            &quals,
+            2,
+            10,
+            DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+            DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+            3,
+        );
+        let eight_mer = motifs.iter().find(|m| m.len() == 8);
+        assert!(
+            eight_mer.is_some_and(|m| degenerate_count(m) == 3),
+            "expected the 3-degenerate 8bp motif to survive with a relaxed \"other\" cap of 3: {motifs:?}"
+        );
     }
 }

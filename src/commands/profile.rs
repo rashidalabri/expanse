@@ -45,10 +45,34 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = irr::DEFAULT_MOTIF_MAX_LEN)]
     pub motif_max_len: u32,
 
-    /// Merge IRR candidate locations within this many bp of each other into
+    /// Maximum number of IUPAC-ambiguous (non-A/C/G/T) positions allowed in
+    /// a mononucleotide (1bp) motif; motifs exceeding this are rejected.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE)]
+    pub max_degenerate_mononucleotide: u32,
+
+    /// Same, for a dinucleotide (2bp) motif.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE)]
+    pub max_degenerate_dinucleotide: u32,
+
+    /// Same, for a trinucleotide (3bp) motif.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE)]
+    pub max_degenerate_trinucleotide: u32,
+
+    /// Same, for any motif of 4bp or longer.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_OTHER)]
+    pub max_degenerate_other: u32,
+
+    /// Merge anchor (mate) locations within this many bp of each other into
     /// one anchor region for `--summary`.
     #[arg(long, default_value_t = 500)]
     pub anchor_merge_distance: i64,
+
+    /// Assumed read length (bp) of a candidate's mate, used to approximate
+    /// the mate's alignment span as `[mate_pos, mate_pos + read_length)`
+    /// for `--summary`, since the mate itself is never fetched -- only its
+    /// recorded location (BAM RNEXT/PNEXT) is used.
+    #[arg(long, default_value_t = 150)]
+    pub read_length: i64,
 
     /// Reference FASTA. Required when the input or output uses CRAM.
     #[arg(short = 'r', long)]
@@ -69,14 +93,16 @@ pub enum OutputFormat {
     Cram,
 }
 
-/// One entry in the `--summary` JSON output: a merged anchor region (IRR
-/// candidate locations within `--anchor-merge-distance` bp of each other),
-/// with its IRR support broken down by (canonical) motif. A read that
-/// qualifies under more than one motif is counted once in `irr_count` but
-/// once per motif in `motifs`, so the `motifs` values can sum to more than
-/// `irr_count`. A motif key may contain IUPAC ambiguity codes (e.g. `GCN`,
-/// `AARRG`) at positions that are consistently mixed across repeat copies;
-/// see `irr::classify_in_repeat_read_all`.
+/// One entry in the `--summary` JSON output: a merged anchor region --
+/// IRR candidates' *mate* locations (each approximated as
+/// `[mate_pos, mate_pos + read_length)`), merged within
+/// `--anchor-merge-distance` bp of each other -- with the anchored IRR
+/// support broken down by (canonical) motif. A read that qualifies under
+/// more than one motif is counted once in `irr_count` but once per motif
+/// in `motifs`, so the `motifs` values can sum to more than `irr_count`.
+/// A motif key may contain IUPAC ambiguity codes (e.g. `GCN`, `AARRG`) at
+/// positions that are consistently mixed across repeat copies; see
+/// `irr::classify_in_repeat_read_all`.
 #[derive(Serialize, Debug)]
 struct AnchorRegionSummary {
     chrom: String,
@@ -151,13 +177,15 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     };
 
     let mut candidate_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
-    // Each surviving candidate's own location and every canonical motif it
-    // qualifies under, used to build the merged anchor-region summary below.
-    let mut candidate_regions: Vec<Region> = Vec::new();
+    // Each surviving candidate's anchor (mate) location and every canonical
+    // motif the candidate qualifies under, used to build the merged
+    // anchor-region summary below. Parallel to `candidate_motifs`.
+    let mut anchor_regions: Vec<Region> = Vec::new();
     let mut candidate_motifs: Vec<Vec<Vec<u8>>> = Vec::new();
 
     let mut pass_count: u64 = 0;
     let mut written_count: u64 = 0;
+    let mut unanchored_count: u64 = 0;
     let mut record = Record::new();
     for region in &bed_fetch_regions {
         reader
@@ -183,6 +211,10 @@ pub fn run(args: ProfileArgs) -> Result<()> {
                 record.qual(),
                 args.motif_min_len,
                 args.motif_max_len,
+                args.max_degenerate_mononucleotide,
+                args.max_degenerate_dinucleotide,
+                args.max_degenerate_trinucleotide,
+                args.max_degenerate_other,
             );
             if motifs.is_empty() {
                 continue;
@@ -197,12 +229,17 @@ pub fn run(args: ProfileArgs) -> Result<()> {
                 record.flags(),
             );
             if candidate_keys.insert(key) {
-                candidate_regions.push(Region {
-                    tid: record.tid(),
-                    start: record.pos(),
-                    end: record.pos() + 1,
-                });
-                candidate_motifs.push(motifs);
+                if record.is_mate_unmapped() {
+                    // No anchor to report this candidate against.
+                    unanchored_count += 1;
+                } else {
+                    anchor_regions.push(Region {
+                        tid: record.mtid(),
+                        start: record.mpos(),
+                        end: record.mpos() + args.read_length,
+                    });
+                    candidate_motifs.push(motifs);
+                }
 
                 if let Some(writer) = writer.as_mut() {
                     writer
@@ -218,18 +255,18 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     // step below allocates its own structures.
     drop(candidate_keys);
 
-    let anchor_clusters = bed::merge_within(&candidate_regions, args.anchor_merge_distance);
-    let candidate_cluster: Vec<usize> = candidate_regions
+    let anchor_clusters = bed::merge_within(&anchor_regions, args.anchor_merge_distance);
+    let candidate_cluster: Vec<usize> = anchor_regions
         .iter()
         .map(|region| {
             bed::locate(&anchor_clusters, region.tid, region.start)
-                .expect("every candidate must fall within its own merged cluster")
+                .expect("every candidate's anchor must fall within its own merged cluster")
         })
         .collect();
     // Save the count for the log message below, then free the rest: no
     // longer needed now that every candidate has been assigned a cluster.
-    let candidate_count = candidate_regions.len();
-    drop(candidate_regions);
+    let anchored_count = anchor_regions.len();
+    drop(anchor_regions);
 
     // `cluster_irr_counts` counts each candidate read once per cluster,
     // regardless of how many motifs it qualified under; `cluster_motif_counts`
@@ -272,10 +309,11 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
     log::info!(
         "profile: {} region fetches ({} BED regions), {pass_count} candidate IRR reads \
-         ({} distinct), {} anchor regions summarized to {:?}{}",
+         ({} distinct, {anchored_count} anchored, {unanchored_count} dropped for lacking a \
+         mapped mate), {} anchor regions summarized to {:?}{}",
         bed_fetch_regions.len(),
         bed_regions.len(),
-        candidate_count,
+        anchored_count as u64 + unanchored_count,
         anchor_clusters.len(),
         args.summary,
         if args.output.is_some() {

@@ -35,12 +35,22 @@ fn non_repetitive_seq() -> Vec<u8> {
 /// a hardcoded (and possibly wrong) guess at its output.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
-    let motif = expanse::irr::classify_in_repeat_read(seq, &quals, 2, 20)
-        .expect("fixture sequence should classify as an IRR");
+    let motif = expanse::irr::classify_in_repeat_read(
+        seq,
+        &quals,
+        2,
+        20,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
+    )
+    .expect("fixture sequence should classify as an IRR");
     String::from_utf8(motif).expect("motif should be ASCII bases")
 }
 
-fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, seq: &[u8]) -> Record {
+#[allow(clippy::too_many_arguments)]
+fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, mtid: i32, mpos: i64, seq: &[u8]) -> Record {
     let mut record = Record::new();
     let qual = vec![40u8; seq.len()];
     let cigar = CigarString(vec![Cigar::Match(seq.len() as u32)]);
@@ -48,8 +58,8 @@ fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, seq: &[u8]
     record.set_tid(tid);
     record.set_pos(pos);
     record.set_mapq(mapq);
-    record.set_mtid(-1);
-    record.set_mpos(-1);
+    record.set_mtid(mtid);
+    record.set_mpos(mpos);
     record.set_flags(flags);
     record
 }
@@ -73,10 +83,11 @@ fn scratch_path(name: &str) -> PathBuf {
 /// Builds a small coordinate-sorted, indexed BAM on chr1 with several reads
 /// designed to exercise the pass-1 candidate extraction logic end to end:
 ///  - "irrIn": low-mapq, IRR-classified (CAG-repeat sequence), inside the
-///    BED region -> should end up in the output.
+///    BED region, mate mapped at 5000 -> should end up in the --output BAM
+///    and anchor its mate's location (not its own) in the summary.
 ///  - "irrUnmappedMate": low-mapq, IRR-classified, inside the BED region,
-///    but its mate is unmapped -> mate status no longer matters, so this
-///    should still be written.
+///    but its mate is unmapped -> still written to --output, but has no
+///    anchor to contribute to the summary.
 ///  - "highMapq": high-mapq, inside the BED region -> excluded by the MAPQ
 ///    filter.
 ///  - "nonRepetitive": low-mapq, inside the BED region, but its sequence is
@@ -97,11 +108,11 @@ fn fixture_records() -> Vec<Record> {
     let non_repetitive = non_repetitive_seq();
 
     vec![
-        make_record("irrIn", 0, 100, 10, PAIRED | READ1, &irr),
-        make_record("irrUnmappedMate", 0, 105, 12, PAIRED | READ1 | MUNMAP, &irr),
-        make_record("highMapq", 0, 120, 60, PAIRED | READ1, &irr),
-        make_record("nonRepetitive", 0, 140, 8, PAIRED | READ1, &non_repetitive),
-        make_record("outsideRegion", 0, 9000, 5, PAIRED | READ1, &irr),
+        make_record("irrIn", 0, 100, 10, PAIRED | READ1, 0, 5000, &irr),
+        make_record("irrUnmappedMate", 0, 105, 12, PAIRED | READ1 | MUNMAP, -1, -1, &irr),
+        make_record("highMapq", 0, 120, 60, PAIRED | READ1, 0, 6000, &irr),
+        make_record("nonRepetitive", 0, 140, 8, PAIRED | READ1, 0, 7000, &non_repetitive),
+        make_record("outsideRegion", 0, 9000, 5, PAIRED | READ1, 0, 9500, &irr),
     ]
 }
 
@@ -189,12 +200,17 @@ fn profile_extracts_irr_candidates() {
     let args = ProfileArgs {
         bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
-        summary: summary_path,
+        summary: summary_path.clone(),
         output: Some(output_path.clone()),
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
+        read_length: 150,
         reference: None,
         output_format: None,
         threads: 1,
@@ -221,6 +237,22 @@ fn profile_extracts_irr_candidates() {
         "low-mapq but non-repetitive read should be excluded by the IRR purity filter"
     );
     assert!(!counts.contains_key("outsideRegion"), "out-of-region read should be excluded");
+
+    // The summary reports the *anchor* (mate) location, not the IRR read's
+    // own location: only "irrIn" has a mapped mate (at 5000), so it's the
+    // only entry, spanning [mate_pos, mate_pos + read_length).
+    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+    assert_eq!(
+        regions.len(),
+        1,
+        "only irrIn has a mapped mate to anchor on: {summary:#}"
+    );
+    assert_eq!(regions[0]["chrom"], "chr1");
+    assert_eq!(regions[0]["start"], 5000);
+    assert_eq!(regions[0]["end"], 5150);
+    assert_eq!(regions[0]["irr_count"], 1);
 }
 
 /// With `--output` omitted, no alignment file should be written at all,
@@ -239,7 +271,12 @@ fn profile_writes_no_bam_output_by_default() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
+        read_length: 150,
         reference: None,
         output_format: None,
         threads: 1,
@@ -261,12 +298,17 @@ fn profile_extracts_irr_candidates_cram() {
     let args = ProfileArgs {
         bed: bed_path,
         input: cram_path.to_str().unwrap().to_string(),
-        summary: summary_path,
+        summary: summary_path.clone(),
         output: Some(output_path.clone()),
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
+        read_length: 150,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
         threads: 1,
@@ -293,26 +335,42 @@ fn profile_extracts_irr_candidates_cram() {
         "low-mapq but non-repetitive read should be excluded by the IRR purity filter"
     );
     assert!(!counts.contains_key("outsideRegion"), "out-of-region read should be excluded");
+
+    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+    assert_eq!(
+        regions.len(),
+        1,
+        "only irrIn has a mapped mate to anchor on: {summary:#}"
+    );
+    assert_eq!(regions[0]["chrom"], "chr1");
+    assert_eq!(regions[0]["start"], 5000);
+    assert_eq!(regions[0]["end"], 5150);
+    assert_eq!(regions[0]["irr_count"], 1);
 }
 
-/// Two BED regions far apart on chr1, each containing IRR candidates:
-///  - the first region (50-150) has two CAG-motif candidates 5bp apart and
-///    one GATA-motif candidate 5bp further -> all three should merge into a
-///    single anchor region under any reasonable merge distance, with counts
-///    broken down 2 (CAG) / 1 (GATA).
-///  - the second region (2950-3050) has a single CAG-motif candidate,
-///    ~2930bp away from the first cluster -> far enough that the default
-///    500bp `--anchor-merge-distance` keeps it as its own anchor region,
-///    but a large enough distance (3000) merges it into the first.
+/// Four candidate reads, all with their own position inside one BED region
+/// (50-150, so a single fetch picks all of them up), but whose *mate*
+/// (anchor) locations define two separate clusters:
+///  - "motifA_1"/"motifA_2" (CAG) and "motifB_1" (GATA) anchor at 3000,
+///    3005, 3010 -- close enough that their (default 150bp `--read-length`)
+///    spans overlap and merge into a single near anchor region spanning
+///    [3000, 3160), with counts broken down 2 (CAG) / 1 (GATA).
+///  - "farCluster_1" (CAG) anchors at 4160, 1000bp past the near cluster's
+///    merged end (3160) -- far enough that the default 500bp
+///    `--anchor-merge-distance` keeps it as its own anchor region ([4160,
+///    4310)), but a large enough distance (3000) merges it into the near
+///    one.
 fn summary_fixture_records() -> Vec<Record> {
     let cag = irr_seq();
     let gata = gata_seq();
 
     vec![
-        make_record("motifA_1", 0, 60, 10, PAIRED | READ1, &cag),
-        make_record("motifA_2", 0, 65, 10, PAIRED | READ1, &cag),
-        make_record("motifB_1", 0, 70, 10, PAIRED | READ1, &gata),
-        make_record("farCluster_1", 0, 3000, 10, PAIRED | READ1, &cag),
+        make_record("motifA_1", 0, 60, 10, PAIRED | READ1, 0, 3000, &cag),
+        make_record("motifA_2", 0, 65, 10, PAIRED | READ1, 0, 3005, &cag),
+        make_record("motifB_1", 0, 70, 10, PAIRED | READ1, 0, 3010, &gata),
+        make_record("farCluster_1", 0, 75, 10, PAIRED | READ1, 0, 4160, &cag),
     ]
 }
 
@@ -329,12 +387,7 @@ fn build_summary_fixture_bam() -> (PathBuf, PathBuf) {
 
     index::build(&bam_path, None, Type::Bai, 1).unwrap();
 
-    let bed_path = scratch_path("summary_fixture.bed");
-    let mut bed_file = File::create(&bed_path).unwrap();
-    writeln!(bed_file, "chr1\t50\t150").unwrap();
-    writeln!(bed_file, "chr1\t2950\t3050").unwrap();
-
-    (bam_path, bed_path)
+    (bam_path, build_fixture_bed())
 }
 
 #[test]
@@ -350,7 +403,12 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
+        read_length: 150,
         reference: None,
         output_format: None,
         threads: 1,
@@ -371,16 +429,16 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
 
     let near = &regions[0];
     assert_eq!(near["chrom"], "chr1");
-    assert_eq!(near["start"], 60);
-    assert_eq!(near["end"], 71);
+    assert_eq!(near["start"], 3000);
+    assert_eq!(near["end"], 3160);
     assert_eq!(near["irr_count"], 3);
     assert_eq!(near["motifs"][&cag_motif], 2, "expected 2 CAG-motif IRRs: {summary:#}");
     assert_eq!(near["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
 
     let far = &regions[1];
     assert_eq!(far["chrom"], "chr1");
-    assert_eq!(far["start"], 3000);
-    assert_eq!(far["end"], 3001);
+    assert_eq!(far["start"], 4160);
+    assert_eq!(far["end"], 4310);
     assert_eq!(far["irr_count"], 1);
     assert_eq!(far["motifs"][&cag_motif], 1);
 }
@@ -398,7 +456,12 @@ fn profile_summary_merges_anchors_within_custom_distance() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 3000,
+        read_length: 150,
         reference: None,
         output_format: None,
         threads: 1,
@@ -420,8 +483,8 @@ fn profile_summary_merges_anchors_within_custom_distance() {
     );
     let region = &regions[0];
     assert_eq!(region["chrom"], "chr1");
-    assert_eq!(region["start"], 60);
-    assert_eq!(region["end"], 3001);
+    assert_eq!(region["start"], 3000);
+    assert_eq!(region["end"], 4310);
     assert_eq!(region["irr_count"], 4);
     assert_eq!(region["motifs"][&cag_motif], 3, "expected 3 CAG-motif IRRs: {summary:#}");
     assert_eq!(region["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
@@ -450,7 +513,7 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
 
     {
         let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        writer.write(&make_record("multiMotif", 0, 60, 10, PAIRED | READ1, &seq)).unwrap();
+        writer.write(&make_record("multiMotif", 0, 60, 10, PAIRED | READ1, 0, 5000, &seq)).unwrap();
     }
     index::build(&bam_path, None, Type::Bai, 1).unwrap();
 
@@ -468,7 +531,12 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
         max_irr_mapq: 40,
         motif_min_len: 1,
         motif_max_len: 30,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
+        read_length: 150,
         reference: None,
         output_format: None,
         threads: 1,
@@ -518,7 +586,7 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
 
     {
         let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        writer.write(&make_record("iupacMotif", 0, 60, 10, PAIRED | READ1, &seq)).unwrap();
+        writer.write(&make_record("iupacMotif", 0, 60, 10, PAIRED | READ1, 0, 5000, &seq)).unwrap();
     }
     index::build(&bam_path, None, Type::Bai, 1).unwrap();
 
@@ -536,7 +604,12 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
         max_irr_mapq: 40,
         motif_min_len: 1,
         motif_max_len: 30,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
+        read_length: 150,
         reference: None,
         output_format: None,
         threads: 1,

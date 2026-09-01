@@ -66,6 +66,23 @@ pub struct FindSinksArgs {
     #[arg(long, default_value_t = irr::DEFAULT_MOTIF_MAX_LEN)]
     pub motif_max_len: u32,
 
+    /// Maximum number of IUPAC-ambiguous (non-A/C/G/T) positions allowed in
+    /// a mononucleotide (1bp) motif; motifs exceeding this are rejected.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE)]
+    pub max_degenerate_mononucleotide: u32,
+
+    /// Same, for a dinucleotide (2bp) motif.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE)]
+    pub max_degenerate_dinucleotide: u32,
+
+    /// Same, for a trinucleotide (3bp) motif.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE)]
+    pub max_degenerate_trinucleotide: u32,
+
+    /// Same, for any motif of 4bp or longer.
+    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_OTHER)]
+    pub max_degenerate_other: u32,
+
     /// Reference FASTA. Required when the input is CRAM.
     #[arg(short = 'r', long)]
     pub reference: Option<PathBuf>,
@@ -278,6 +295,10 @@ fn classify(record: &Record, args: &FindSinksArgs) -> ReadKind {
             record.qual(),
             args.motif_min_len,
             args.motif_max_len,
+            args.max_degenerate_mononucleotide,
+            args.max_degenerate_dinucleotide,
+            args.max_degenerate_trinucleotide,
+            args.max_degenerate_other,
         )
     {
         // `.max(pos + 1)` guards against a degenerate empty CIGAR (no

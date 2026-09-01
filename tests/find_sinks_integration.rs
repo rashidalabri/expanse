@@ -34,8 +34,17 @@ fn non_repetitive_seq() -> Vec<u8> {
 /// instead of a hardcoded (and possibly wrong) guess at its output.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
-    let motif =
-        expanse::irr::classify_in_repeat_read(seq, &quals, 2, 20).expect("fixture sequence should classify as an IRR");
+    let motif = expanse::irr::classify_in_repeat_read(
+        seq,
+        &quals,
+        2,
+        20,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
+    )
+    .expect("fixture sequence should classify as an IRR");
     String::from_utf8(motif).expect("motif should be ASCII bases")
 }
 
@@ -199,6 +208,10 @@ fn find_sinks_end_to_end() {
         min_anchor_mapq: 50,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         reference: None,
         threads: 1,
     };
@@ -282,6 +295,10 @@ fn find_sinks_requires_reference_for_cram_input() {
         min_anchor_mapq: 50,
         motif_min_len: 2,
         motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         reference: None,
         threads: 1,
     };
