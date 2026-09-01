@@ -74,13 +74,6 @@ pub fn locate(regions: &[Region], tid: i32, pos: i64) -> Option<usize> {
     (region.tid == tid && region.start <= pos && pos < region.end).then_some(idx - 1)
 }
 
-/// Test whether `(tid, pos)` falls within one of `regions`, which must be
-/// sorted and non-overlapping per contig (i.e. the output of
-/// [`merge_regions`] or [`merge_within`]).
-pub fn contains(regions: &[Region], tid: i32, pos: i64) -> bool {
-    locate(regions, tid, pos).is_some()
-}
-
 /// Sort and merge overlapping/touching regions, per contig.
 pub fn merge_regions(regions: &[Region]) -> Vec<Region> {
     merge_within(regions, 0)
@@ -211,22 +204,6 @@ mod tests {
     fn merge_empty() {
         let merged = merge_regions(&[]);
         assert!(merged.is_empty());
-    }
-
-    #[test]
-    fn contains_finds_pos_within_a_region() {
-        let regions = merge_regions(&[r(0, 10, 20), r(0, 30, 40), r(1, 5, 15)]);
-        assert!(contains(&regions, 0, 10));
-        assert!(contains(&regions, 0, 19));
-        assert!(contains(&regions, 1, 10));
-        assert!(!contains(&regions, 0, 20));
-        assert!(!contains(&regions, 0, 25));
-        assert!(!contains(&regions, 2, 10));
-    }
-
-    #[test]
-    fn contains_empty_regions_is_always_false() {
-        assert!(!contains(&[], 0, 10));
     }
 
     #[test]

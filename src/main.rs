@@ -16,7 +16,6 @@ fn main() {
 
     let result = match cli.command {
         Commands::Profile(args) => commands::profile::run(args),
-        Commands::FindSinks(args) => commands::find_sinks::run(args),
     };
 
     if let Err(err) = result {
