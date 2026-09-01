@@ -13,11 +13,16 @@ use expanse::commands::profile::{run, OutputFormat, ProfileArgs};
 const PAIRED: u16 = 1;
 const MUNMAP: u16 = 8;
 const READ1: u16 = 64;
-const READ2: u16 = 128;
 
 /// A clean CAG-repeat read: passes the IRR purity filter.
 fn irr_seq() -> Vec<u8> {
     "CAG".repeat(20).into_bytes()
+}
+
+/// A GATA-repeat read: passes the IRR purity filter with a different (4bp)
+/// motif than `irr_seq`'s CAG (3bp).
+fn gata_seq() -> Vec<u8> {
+    "GATA".repeat(15).into_bytes()
 }
 
 /// An aperiodic read: fails the IRR purity filter despite low MAPQ.
@@ -25,8 +30,17 @@ fn non_repetitive_seq() -> Vec<u8> {
     b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA".to_vec()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, mtid: i32, mpos: i64, seq: &[u8]) -> Record {
+/// The canonical motif `expanse::irr::classify_in_repeat_read` assigns to
+/// `seq`, used so tests assert against the real canonicalization instead of
+/// a hardcoded (and possibly wrong) guess at its output.
+fn canonical_motif(seq: &[u8]) -> String {
+    let quals = vec![40u8; seq.len()];
+    let motif = expanse::irr::classify_in_repeat_read(seq, &quals, 2, 20)
+        .expect("fixture sequence should classify as an IRR");
+    String::from_utf8(motif).expect("motif should be ASCII bases")
+}
+
+fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, seq: &[u8]) -> Record {
     let mut record = Record::new();
     let qual = vec![40u8; seq.len()];
     let cigar = CigarString(vec![Cigar::Match(seq.len() as u32)]);
@@ -34,8 +48,8 @@ fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, mtid: i32,
     record.set_tid(tid);
     record.set_pos(pos);
     record.set_mapq(mapq);
-    record.set_mtid(mtid);
-    record.set_mpos(mpos);
+    record.set_mtid(-1);
+    record.set_mpos(-1);
     record.set_flags(flags);
     record
 }
@@ -56,27 +70,19 @@ fn scratch_path(name: &str) -> PathBuf {
     dir.join(name)
 }
 
-/// Builds a small coordinate-sorted, indexed BAM on chr1 with several read
-/// pairs designed to exercise the two-pass extraction logic end to end:
-///  - "pairA": read1 is low-mapq, IRR-classified (CAG-repeat sequence)
-///    inside the BED region; mate is high-mapq far away -> both should end
-///    up in the output (pass 1 + pass 2).
-///  - "pairB": both ends high-mapq inside the BED region -> excluded.
-///  - "pairC": read1 is low-mapq, IRR-classified, inside the BED region,
-///    but its mate is unmapped -> excluded entirely in pass 1 (an IRR read
-///    with no mate to anchor it is never a candidate).
-///  - "pairD": low-mapq, IRR-classified read1 entirely outside the BED
-///    region -> never seen by pass 1 (region-restricted fetch), excluded.
-///  - "pairE": read1 is low-mapq and inside the BED region, but its
-///    sequence is NOT repetitive -> must be excluded by the IRR purity
-///    filter despite passing the MAPQ threshold, and its mate must not be
-///    fetched either.
-///  - "pairF": read1 is low-mapq, IRR-classified, inside the BED region,
-///    but its mate's own MAPQ is below `min_anchor_mapq` -> the mate is
-///    excluded from pass 2, and read1 itself must then be dropped in the
-///    final filtering step since it has no passing anchor.
-///  - "decoyX": high-mapq read that merely overlaps pairA's merged mate
-///    region -> must NOT be pulled in by pass 2 (qname filter).
+/// Builds a small coordinate-sorted, indexed BAM on chr1 with several reads
+/// designed to exercise the pass-1 candidate extraction logic end to end:
+///  - "irrIn": low-mapq, IRR-classified (CAG-repeat sequence), inside the
+///    BED region -> should end up in the output.
+///  - "irrUnmappedMate": low-mapq, IRR-classified, inside the BED region,
+///    but its mate is unmapped -> mate status no longer matters, so this
+///    should still be written.
+///  - "highMapq": high-mapq, inside the BED region -> excluded by the MAPQ
+///    filter.
+///  - "nonRepetitive": low-mapq, inside the BED region, but its sequence is
+///    NOT repetitive -> excluded by the IRR purity filter.
+///  - "outsideRegion": low-mapq, IRR-classified, entirely outside the BED
+///    region -> never seen by the region-restricted fetch, excluded.
 fn fixture_header() -> Header {
     let mut header = Header::new();
     let mut sq = HeaderRecord::new(b"SQ");
@@ -89,21 +95,13 @@ fn fixture_header() -> Header {
 fn fixture_records() -> Vec<Record> {
     let irr = irr_seq();
     let non_repetitive = non_repetitive_seq();
-    let filler = vec![b'A'; 50];
 
     vec![
-        make_record("pairA", 0, 100, 10, PAIRED | READ1, 0, 5000, &irr),
-        make_record("pairF", 0, 105, 12, PAIRED | READ1, 0, 8000, &irr),
-        make_record("pairB", 0, 120, 60, PAIRED | READ1, 0, 6000, &irr),
-        make_record("pairC", 0, 130, 5, PAIRED | READ1 | MUNMAP, -1, -1, &irr),
-        make_record("pairE", 0, 140, 8, PAIRED | READ1, 0, 7000, &non_repetitive),
-        make_record("decoyX", 0, 4950, 60, PAIRED | READ1, -1, -1, &[b'A'; 100]),
-        make_record("pairA", 0, 5000, 60, PAIRED | READ2, 0, 100, &filler),
-        make_record("pairB", 0, 6000, 60, PAIRED | READ2, 0, 120, &filler),
-        make_record("pairE", 0, 7000, 60, PAIRED | READ2, 0, 140, &filler),
-        make_record("pairF", 0, 8000, 30, PAIRED | READ2, 0, 105, &filler),
-        make_record("pairD", 0, 9000, 5, PAIRED | READ1, 0, 9500, &irr),
-        make_record("pairD", 0, 9500, 60, PAIRED | READ2, 0, 9000, &filler),
+        make_record("irrIn", 0, 100, 10, PAIRED | READ1, &irr),
+        make_record("irrUnmappedMate", 0, 105, 12, PAIRED | READ1 | MUNMAP, &irr),
+        make_record("highMapq", 0, 120, 60, PAIRED | READ1, &irr),
+        make_record("nonRepetitive", 0, 140, 8, PAIRED | READ1, &non_repetitive),
+        make_record("outsideRegion", 0, 9000, 5, PAIRED | READ1, &irr),
     ]
 }
 
@@ -150,8 +148,8 @@ fn build_fixture_reference() -> PathBuf {
 }
 
 /// Same fixture data as `build_fixture_bam`, but written as an indexed CRAM
-/// (with a real `.crai`) so the CRAM-slice-merging path in `profile::run`
-/// gets exercised against htslib's own index format, not just BAM/BAI.
+/// so the CRAM fetch path in `profile::run` gets exercised, not just
+/// BAM/BAI.
 fn build_fixture_cram() -> (PathBuf, PathBuf, PathBuf) {
     let cram_path = scratch_path("fixture.cram");
     let reference_path = build_fixture_reference();
@@ -172,38 +170,31 @@ fn build_fixture_cram() -> (PathBuf, PathBuf, PathBuf) {
     (cram_path, reference_path, build_fixture_bed())
 }
 
-fn read_output_qnames(path: &PathBuf) -> Vec<(String, u16)> {
+fn read_output_qnames(path: &PathBuf) -> Vec<String> {
     let mut reader = Reader::from_path(path).unwrap();
     let mut out = Vec::new();
     for result in reader.records() {
         let record = result.unwrap();
-        out.push((String::from_utf8_lossy(record.qname()).to_string(), record.flags()));
+        out.push(String::from_utf8_lossy(record.qname()).to_string());
     }
     out
 }
 
 #[test]
-fn profile_extracts_irr_reads_and_their_mates() {
+fn profile_extracts_irr_candidates() {
     let (bam_path, bed_path) = build_fixture_bam();
     let output_path = scratch_path("output.bam");
+    let summary_path = scratch_path("summary.json");
 
     let args = ProfileArgs {
         bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
+        summary: summary_path,
+        output: Some(output_path.clone()),
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        min_anchor_mapq: 50,
-        // pairA and pairF's anchors are each the only IRR supporting their
-        // own anchor cluster; min_irrs_per_anchor: 1 disables the new
-        // anchor-support filter so this test stays focused on the core
-        // two-pass mechanics (see profile_anchor_clustering_* below for that
-        // feature specifically).
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 1,
-        irr_only: false,
-        anchor_motif_summary: None,
+        anchor_merge_distance: 500,
         reference: None,
         output_format: None,
         threads: 1,
@@ -212,54 +203,43 @@ fn profile_extracts_irr_reads_and_their_mates() {
     run(args).expect("profile run should succeed");
 
     let written = read_output_qnames(&output_path);
-
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (qname, _) in &written {
+    for qname in &written {
         *counts.entry(qname.clone()).or_default() += 1;
     }
 
     assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
-    assert_eq!(counts.get("pairA"), Some(&2), "both pairA reads should be present");
-    assert!(!counts.contains_key("pairB"), "high-mapq pairB should be excluded");
-    assert!(!counts.contains_key("pairC"), "IRR read with an unmapped mate should be excluded entirely");
-    assert!(!counts.contains_key("pairD"), "out-of-region pairD should be excluded");
-    assert!(
-        !counts.contains_key("pairE"),
-        "low-mapq but non-repetitive pairE should be excluded by the IRR purity filter, \
-         and its mate should never be looked up"
+    assert_eq!(counts.get("irrIn"), Some(&1), "low-mapq IRR read inside the region should be written");
+    assert_eq!(
+        counts.get("irrUnmappedMate"),
+        Some(&1),
+        "an unmapped mate should no longer exclude an IRR candidate"
     );
-    assert!(!counts.contains_key("decoyX"), "decoy overlapping the mate region must not be pulled in");
+    assert!(!counts.contains_key("highMapq"), "high-mapq read should be excluded");
     assert!(
-        !counts.contains_key("pairF"),
-        "pairF's read1 must be dropped in the final step since its mate never passed the anchor filter"
+        !counts.contains_key("nonRepetitive"),
+        "low-mapq but non-repetitive read should be excluded by the IRR purity filter"
     );
-
-    let pair_a_flags: Vec<u16> = written.iter().filter(|(q, _)| q == "pairA").map(|(_, f)| *f).collect();
-    assert!(pair_a_flags.contains(&(PAIRED | READ1)));
-    assert!(pair_a_flags.contains(&(PAIRED | READ2)));
+    assert!(!counts.contains_key("outsideRegion"), "out-of-region read should be excluded");
 }
 
-/// With `--irr-only`, pass 2 (mate retrieval) never runs and the
-/// passing-anchor requirement is skipped: every pass-1 IRR candidate is
-/// written as-is, including pairF (whose mate is too low-mapq to count as
-/// an anchor, and so is dropped in the default two-pass mode).
+/// With `--output` omitted, no alignment file should be written at all,
+/// even though the run otherwise succeeds and still produces the JSON
+/// summary.
 #[test]
-fn profile_irr_only_writes_candidates_without_mates() {
+fn profile_writes_no_bam_output_by_default() {
     let (bam_path, bed_path) = build_fixture_bam();
-    let output_path = scratch_path("output_irr_only.bam");
+    let summary_path = scratch_path("summary_no_output.json");
 
     let args = ProfileArgs {
         bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
+        summary: summary_path.clone(),
+        output: None,
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 2,
-        irr_only: true,
-        anchor_motif_summary: None,
+        anchor_merge_distance: 500,
         reference: None,
         output_format: None,
         threads: 1,
@@ -267,59 +247,26 @@ fn profile_irr_only_writes_candidates_without_mates() {
 
     run(args).expect("profile run should succeed");
 
-    let written = read_output_qnames(&output_path);
-
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (qname, _) in &written {
-        *counts.entry(qname.clone()).or_default() += 1;
-    }
-
-    assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
-    assert_eq!(counts.get("pairA"), Some(&1), "pairA's IRR read1 should be written, but not its mate");
-    assert_eq!(counts.get("pairF"), Some(&1), "pairF's IRR read1 should be written despite its low-mapq mate");
-    assert!(!counts.contains_key("pairB"), "high-mapq pairB should be excluded");
-    assert!(!counts.contains_key("pairC"), "IRR read with an unmapped mate should be excluded entirely");
-    assert!(!counts.contains_key("pairD"), "out-of-region pairD should be excluded");
-    assert!(
-        !counts.contains_key("pairE"),
-        "low-mapq but non-repetitive pairE should be excluded by the IRR purity filter"
-    );
-    assert!(!counts.contains_key("decoyX"), "decoy should never be pulled in");
-
-    let written_flags: Vec<u16> = written.iter().map(|(_, f)| *f).collect();
-    assert!(
-        written_flags.iter().all(|f| f & READ2 == 0),
-        "no mate (READ2) records should be written in --irr-only mode: {written:?}"
-    );
+    assert!(summary_path.exists(), "summary JSON should always be written");
 }
 
-/// Same scenario as `profile_extracts_irr_reads_and_their_mates`, but against
-/// a CRAM input, exercising the CRAI-backed slice-merging fetch path (real
-/// `hopen`/`hread2` FFI reads of an htslib-built `.crai`, region expansion,
-/// and the post-fetch region-membership filter) end to end.
+/// Same scenario as `profile_extracts_irr_candidates`, but against a CRAM
+/// input, exercising the indexed per-region CRAM fetch path end to end.
 #[test]
-fn profile_extracts_irr_reads_and_their_mates_cram() {
+fn profile_extracts_irr_candidates_cram() {
     let (cram_path, reference_path, bed_path) = build_fixture_cram();
     let output_path = scratch_path("output_cram.bam");
-
-    // Confirm the CRAI-backed path actually engages (rather than
-    // profile::run silently falling back to per-region fetch on a load
-    // error) before checking output correctness below.
-    let slices = expanse::crai::load(cram_path.to_str().unwrap()).expect("CRAI index should load");
-    assert!(!slices.is_empty(), "expected at least one CRAM slice in the index");
+    let summary_path = scratch_path("summary_cram.json");
 
     let args = ProfileArgs {
         bed: bed_path,
         input: cram_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
+        summary: summary_path,
+        output: Some(output_path.clone()),
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 1,
-        irr_only: false,
-        anchor_motif_summary: None,
+        anchor_merge_distance: 500,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
         threads: 1,
@@ -328,260 +275,82 @@ fn profile_extracts_irr_reads_and_their_mates_cram() {
     run(args).expect("profile run should succeed");
 
     let written = read_output_qnames(&output_path);
-
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (qname, _) in &written {
+    for qname in &written {
         *counts.entry(qname.clone()).or_default() += 1;
     }
 
     assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
-    assert_eq!(counts.get("pairA"), Some(&2), "both pairA reads should be present");
-    assert!(!counts.contains_key("pairB"), "high-mapq pairB should be excluded");
-    assert!(!counts.contains_key("pairC"), "IRR read with an unmapped mate should be excluded entirely");
-    assert!(!counts.contains_key("pairD"), "out-of-region pairD should be excluded");
-    assert!(
-        !counts.contains_key("pairE"),
-        "low-mapq but non-repetitive pairE should be excluded by the IRR purity filter, \
-         and its mate should never be looked up"
+    assert_eq!(counts.get("irrIn"), Some(&1), "low-mapq IRR read inside the region should be written");
+    assert_eq!(
+        counts.get("irrUnmappedMate"),
+        Some(&1),
+        "an unmapped mate should no longer exclude an IRR candidate"
     );
-    assert!(!counts.contains_key("decoyX"), "decoy overlapping the mate region must not be pulled in");
+    assert!(!counts.contains_key("highMapq"), "high-mapq read should be excluded");
     assert!(
-        !counts.contains_key("pairF"),
-        "pairF's read1 must be dropped in the final step since its mate never passed the anchor filter"
+        !counts.contains_key("nonRepetitive"),
+        "low-mapq but non-repetitive read should be excluded by the IRR purity filter"
     );
-
-    let pair_a_flags: Vec<u16> = written.iter().filter(|(q, _)| q == "pairA").map(|(_, f)| *f).collect();
-    assert!(pair_a_flags.contains(&(PAIRED | READ1)));
-    assert!(pair_a_flags.contains(&(PAIRED | READ2)));
+    assert!(!counts.contains_key("outsideRegion"), "out-of-region read should be excluded");
 }
 
-/// Builds a fixture (same header/BED as `build_fixture_bam`) with two IRR
-/// read pairs anchored close together (support one merged anchor region)
-/// and a third IRR read pair anchored far away, alone:
-///  - "clusterA_1" / "clusterA_2": read1s are low-mapq, IRR-classified,
-///    inside the BED region; their mates land at 3000 and 3050, 50bp apart
-///    (well within the default 1000bp `anchor_merge_distance`) -> the two
-///    mate locations merge into one anchor region backed by 2 IRR reads,
-///    meeting the default `min_irrs_per_anchor` of 2, so both pairs survive.
-///  - "clusterB_1": read1 is low-mapq, IRR-classified, inside the BED
-///    region, but its mate at 9000 is the only IRR supporting that anchor
-///    region -> below `min_irrs_per_anchor`, so the anchor region is
-///    dropped from pass 2 entirely and clusterB_1's read1 must never be
-///    written either.
-fn anchor_clustering_fixture_records() -> Vec<Record> {
-    let irr = irr_seq();
-    let filler = vec![b'A'; 50];
-
-    vec![
-        make_record("clusterA_1", 0, 60, 10, PAIRED | READ1, 0, 3000, &irr),
-        make_record("clusterA_2", 0, 65, 10, PAIRED | READ1, 0, 3050, &irr),
-        make_record("clusterB_1", 0, 70, 10, PAIRED | READ1, 0, 9000, &irr),
-        make_record("clusterA_1", 0, 3000, 60, PAIRED | READ2, 0, 60, &filler),
-        make_record("clusterA_2", 0, 3050, 60, PAIRED | READ2, 0, 65, &filler),
-        make_record("clusterB_1", 0, 9000, 60, PAIRED | READ2, 0, 70, &filler),
-    ]
-}
-
-fn build_anchor_clustering_fixture_bam() -> (PathBuf, PathBuf) {
-    let bam_path = scratch_path("anchor_clustering_fixture.bam");
-    let header = fixture_header();
-
-    {
-        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        for record in &anchor_clustering_fixture_records() {
-            writer.write(record).unwrap();
-        }
-    }
-
-    index::build(&bam_path, None, Type::Bai, 1).unwrap();
-
-    (bam_path, build_fixture_bed())
-}
-
-#[test]
-fn profile_anchor_clustering_keeps_well_supported_regions() {
-    let (bam_path, bed_path) = build_anchor_clustering_fixture_bam();
-    let output_path = scratch_path("output_anchor_clustering.bam");
-
-    let args = ProfileArgs {
-        bed: bed_path,
-        input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
-        max_irr_mapq: 40,
-        motif_min_len: 2,
-        motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 2,
-        irr_only: false,
-        anchor_motif_summary: None,
-        reference: None,
-        output_format: None,
-        threads: 1,
-    };
-
-    run(args).expect("profile run should succeed");
-
-    let written = read_output_qnames(&output_path);
-
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (qname, _) in &written {
-        *counts.entry(qname.clone()).or_default() += 1;
-    }
-
-    assert_eq!(written.len(), 4, "expected exactly 4 records, got {written:?}");
-    assert_eq!(counts.get("clusterA_1"), Some(&2), "clusterA_1's IRR read and mate should both be written");
-    assert_eq!(counts.get("clusterA_2"), Some(&2), "clusterA_2's IRR read and mate should both be written");
-    assert!(
-        !counts.contains_key("clusterB_1"),
-        "clusterB_1 is the lone IRR supporting its anchor region, below \
-         min_irrs_per_anchor, so its anchor region (and the read itself) \
-         must be dropped entirely: {written:?}"
-    );
-}
-
-/// Same fixture as `profile_anchor_clustering_keeps_well_supported_regions`,
-/// but with `min_irrs_per_anchor: 1`, which disables the anchor-support
-/// filter: all three IRR pairs (including the previously-dropped
-/// clusterB_1) should now survive.
-#[test]
-fn profile_anchor_clustering_min_irrs_of_one_keeps_everything() {
-    let (bam_path, bed_path) = build_anchor_clustering_fixture_bam();
-    let output_path = scratch_path("output_anchor_clustering_min1.bam");
-
-    let args = ProfileArgs {
-        bed: bed_path,
-        input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
-        max_irr_mapq: 40,
-        motif_min_len: 2,
-        motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 1,
-        irr_only: false,
-        anchor_motif_summary: None,
-        reference: None,
-        output_format: None,
-        threads: 1,
-    };
-
-    run(args).expect("profile run should succeed");
-
-    let written = read_output_qnames(&output_path);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (qname, _) in &written {
-        *counts.entry(qname.clone()).or_default() += 1;
-    }
-
-    assert_eq!(written.len(), 6, "expected exactly 6 records, got {written:?}");
-    assert_eq!(counts.get("clusterA_1"), Some(&2));
-    assert_eq!(counts.get("clusterA_2"), Some(&2));
-    assert_eq!(counts.get("clusterB_1"), Some(&2), "with min_irrs_per_anchor: 1, clusterB_1 should survive too");
-}
-
-/// Same well-supported-vs-lone-anchor fixture, but with
-/// `anchor_merge_distance: 40`, which is too short to merge clusterA_1's
-/// and clusterA_2's mate locations (3000 and 3050, 50bp apart) into one
-/// region: each then has only 1 IRR supporting it, so with the default
-/// `min_irrs_per_anchor: 2` both are dropped, alongside clusterB_1.
-#[test]
-fn profile_anchor_clustering_short_merge_distance_splits_clusters() {
-    let (bam_path, bed_path) = build_anchor_clustering_fixture_bam();
-    let output_path = scratch_path("output_anchor_clustering_short_distance.bam");
-
-    let args = ProfileArgs {
-        bed: bed_path,
-        input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
-        max_irr_mapq: 40,
-        motif_min_len: 2,
-        motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 40,
-        min_irrs_per_anchor: 2,
-        irr_only: false,
-        anchor_motif_summary: None,
-        reference: None,
-        output_format: None,
-        threads: 1,
-    };
-
-    run(args).expect("profile run should succeed");
-
-    let written = read_output_qnames(&output_path);
-    assert!(written.is_empty(), "expected no records once clusterA is split apart by too-short a merge distance: {written:?}");
-}
-
-/// A GATA-repeat read: passes the IRR purity filter with a different
-/// (4bp) motif than `irr_seq`'s CAG (3bp).
-fn gata_seq() -> Vec<u8> {
-    "GATA".repeat(15).into_bytes()
-}
-
-/// The canonical motif `expanse::irr::classify_in_repeat_read` assigns to
-/// `seq`, used so tests assert against the real canonicalization instead of
-/// a hardcoded (and possibly wrong) guess at its output.
-fn canonical_motif(seq: &[u8]) -> String {
-    let quals = vec![40u8; seq.len()];
-    let motif = expanse::irr::classify_in_repeat_read(seq, &quals, 2, 20)
-        .expect("fixture sequence should classify as an IRR");
-    String::from_utf8(motif).expect("motif should be ASCII bases")
-}
-
-/// Two IRR pairs with a CAG motif and one with a GATA motif, all anchored
-/// within 40bp of each other (well inside the default 1000bp
-/// `anchor_merge_distance`) so they merge into a single anchor region with
-/// 3 total IRRs split 2 (CAG) / 1 (GATA) across motifs.
-fn motif_summary_fixture_records() -> Vec<Record> {
+/// Two BED regions far apart on chr1, each containing IRR candidates:
+///  - the first region (50-150) has two CAG-motif candidates 5bp apart and
+///    one GATA-motif candidate 5bp further -> all three should merge into a
+///    single anchor region under any reasonable merge distance, with counts
+///    broken down 2 (CAG) / 1 (GATA).
+///  - the second region (2950-3050) has a single CAG-motif candidate,
+///    ~2930bp away from the first cluster -> far enough that the default
+///    500bp `--anchor-merge-distance` keeps it as its own anchor region,
+///    but a large enough distance (3000) merges it into the first.
+fn summary_fixture_records() -> Vec<Record> {
     let cag = irr_seq();
     let gata = gata_seq();
-    let filler = vec![b'A'; 50];
 
     vec![
-        make_record("motifA_1", 0, 60, 10, PAIRED | READ1, 0, 3000, &cag),
-        make_record("motifA_2", 0, 65, 10, PAIRED | READ1, 0, 3020, &cag),
-        make_record("motifB_1", 0, 70, 10, PAIRED | READ1, 0, 3040, &gata),
-        make_record("motifA_1", 0, 3000, 60, PAIRED | READ2, 0, 60, &filler),
-        make_record("motifA_2", 0, 3020, 60, PAIRED | READ2, 0, 65, &filler),
-        make_record("motifB_1", 0, 3040, 60, PAIRED | READ2, 0, 70, &filler),
+        make_record("motifA_1", 0, 60, 10, PAIRED | READ1, &cag),
+        make_record("motifA_2", 0, 65, 10, PAIRED | READ1, &cag),
+        make_record("motifB_1", 0, 70, 10, PAIRED | READ1, &gata),
+        make_record("farCluster_1", 0, 3000, 10, PAIRED | READ1, &cag),
     ]
 }
 
-fn build_motif_summary_fixture_bam() -> (PathBuf, PathBuf) {
-    let bam_path = scratch_path("motif_summary_fixture.bam");
+fn build_summary_fixture_bam() -> (PathBuf, PathBuf) {
+    let bam_path = scratch_path("summary_fixture.bam");
     let header = fixture_header();
 
     {
         let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        for record in &motif_summary_fixture_records() {
+        for record in &summary_fixture_records() {
             writer.write(record).unwrap();
         }
     }
 
     index::build(&bam_path, None, Type::Bai, 1).unwrap();
 
-    (bam_path, build_fixture_bed())
+    let bed_path = scratch_path("summary_fixture.bed");
+    let mut bed_file = File::create(&bed_path).unwrap();
+    writeln!(bed_file, "chr1\t50\t150").unwrap();
+    writeln!(bed_file, "chr1\t2950\t3050").unwrap();
+
+    (bam_path, bed_path)
 }
 
 #[test]
-fn profile_writes_anchor_motif_summary_json() {
-    let (bam_path, bed_path) = build_motif_summary_fixture_bam();
-    let output_path = scratch_path("output_motif_summary.bam");
-    let summary_path = scratch_path("anchor_motif_summary.json");
+fn profile_summary_keeps_distant_anchors_separate_by_default() {
+    let (bam_path, bed_path) = build_summary_fixture_bam();
+    let summary_path = scratch_path("summary_distant.json");
 
     let args = ProfileArgs {
         bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
+        summary: summary_path.clone(),
+        output: None,
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 2,
-        irr_only: false,
-        anchor_motif_summary: Some(summary_path.clone()),
+        anchor_merge_distance: 500,
         reference: None,
         output_format: None,
         threads: 1,
@@ -595,41 +364,41 @@ fn profile_writes_anchor_motif_summary_json() {
 
     let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
     let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
-    let regions = summary.as_array().expect("summary should be a JSON array");
+    let mut regions = summary.as_array().expect("summary should be a JSON array").clone();
+    regions.sort_by_key(|region| region["start"].as_i64().unwrap());
 
-    assert_eq!(regions.len(), 1, "expected exactly one merged anchor region, got {summary:#}");
-    let region = &regions[0];
+    assert_eq!(regions.len(), 2, "expected two separate anchor regions, got {summary:#}");
 
-    assert_eq!(region["chrom"], "chr1");
-    assert_eq!(region["start"], 3000);
-    assert_eq!(region["end"], 3041);
-    assert_eq!(region["irr_count"], 3);
-    assert_eq!(region["motifs"][&cag_motif], 2, "expected 2 CAG-motif IRRs: {summary:#}");
-    assert_eq!(region["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
+    let near = &regions[0];
+    assert_eq!(near["chrom"], "chr1");
+    assert_eq!(near["start"], 60);
+    assert_eq!(near["end"], 71);
+    assert_eq!(near["irr_count"], 3);
+    assert_eq!(near["motifs"][&cag_motif], 2, "expected 2 CAG-motif IRRs: {summary:#}");
+    assert_eq!(near["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
+
+    let far = &regions[1];
+    assert_eq!(far["chrom"], "chr1");
+    assert_eq!(far["start"], 3000);
+    assert_eq!(far["end"], 3001);
+    assert_eq!(far["irr_count"], 1);
+    assert_eq!(far["motifs"][&cag_motif], 1);
 }
 
-/// With `--irr-only`, anchor clustering never runs, so
-/// `--anchor-motif-summary` has nothing to report; `profile::run` should
-/// still succeed (just logging a warning) rather than erroring, and no
-/// summary file should be written.
 #[test]
-fn profile_irr_only_skips_anchor_motif_summary() {
-    let (bam_path, bed_path) = build_motif_summary_fixture_bam();
-    let output_path = scratch_path("output_motif_summary_irr_only.bam");
-    let summary_path = scratch_path("anchor_motif_summary_irr_only.json");
+fn profile_summary_merges_anchors_within_custom_distance() {
+    let (bam_path, bed_path) = build_summary_fixture_bam();
+    let summary_path = scratch_path("summary_merged.json");
 
     let args = ProfileArgs {
         bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
-        output: output_path.clone(),
+        summary: summary_path.clone(),
+        output: None,
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        min_anchor_mapq: 50,
-        anchor_merge_distance: 1000,
-        min_irrs_per_anchor: 2,
-        irr_only: true,
-        anchor_motif_summary: Some(summary_path.clone()),
+        anchor_merge_distance: 3000,
         reference: None,
         output_format: None,
         threads: 1,
@@ -637,8 +406,96 @@ fn profile_irr_only_skips_anchor_motif_summary() {
 
     run(args).expect("profile run should succeed");
 
-    assert!(
-        !summary_path.exists(),
-        "no summary file should be written in --irr-only mode"
+    let cag_motif = canonical_motif(&irr_seq());
+    let gata_motif = canonical_motif(&gata_seq());
+
+    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(
+        regions.len(),
+        1,
+        "expected the two clusters to merge into one anchor region, got {summary:#}"
     );
+    let region = &regions[0];
+    assert_eq!(region["chrom"], "chr1");
+    assert_eq!(region["start"], 60);
+    assert_eq!(region["end"], 3001);
+    assert_eq!(region["irr_count"], 4);
+    assert_eq!(region["motifs"][&cag_motif], 3, "expected 3 CAG-motif IRRs: {summary:#}");
+    assert_eq!(region["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
+}
+
+/// A read whose composition is 20 A's followed by a single G, repeated:
+/// mostly-A with only rare G interruptions passes the homopolymer "A"
+/// motif's thresholds despite not being a pure homopolymer, while the exact
+/// 21bp repeat unit also passes on its own -- so
+/// `irr::classify_in_repeat_read_all` legitimately returns two distinct
+/// motifs for it (see the equivalent unit test in `src/irr.rs` for why a
+/// pure homopolymer doesn't trigger this).
+fn mostly_a_with_rare_g_seq() -> Vec<u8> {
+    let unit: Vec<u8> = (0..20).map(|_| b'A').chain(std::iter::once(b'G')).collect();
+    unit.iter().cloned().cycle().take(21 * 16).collect()
+}
+
+/// A single IRR read that qualifies under two distinct motifs should be
+/// counted once in its anchor region's `irr_count`, but once under each of
+/// the two motifs in the `motifs` breakdown.
+#[test]
+fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
+    let bam_path = scratch_path("multi_motif_fixture.bam");
+    let header = fixture_header();
+    let seq = mostly_a_with_rare_g_seq();
+
+    {
+        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
+        writer.write(&make_record("multiMotif", 0, 60, 10, PAIRED | READ1, &seq)).unwrap();
+    }
+    index::build(&bam_path, None, Type::Bai, 1).unwrap();
+
+    let bed_path = scratch_path("multi_motif_fixture.bed");
+    let mut bed_file = File::create(&bed_path).unwrap();
+    writeln!(bed_file, "chr1\t50\t{}", 60 + seq.len() as i64 + 50).unwrap();
+
+    let summary_path = scratch_path("summary_multi_motif.json");
+
+    let args = ProfileArgs {
+        bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        summary: summary_path.clone(),
+        output: None,
+        max_irr_mapq: 40,
+        motif_min_len: 1,
+        motif_max_len: 30,
+        anchor_merge_distance: 500,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(regions.len(), 1, "expected a single anchor region, got {summary:#}");
+    let region = &regions[0];
+
+    assert_eq!(
+        region["irr_count"], 1,
+        "a single read must only be counted once toward the region total, even though it \
+         qualifies under multiple motifs: {summary:#}"
+    );
+
+    let motifs = region["motifs"].as_object().expect("motifs should be a JSON object");
+    assert_eq!(
+        motifs.len(),
+        2,
+        "expected the read's two distinct qualifying motifs to each get their own entry: {summary:#}"
+    );
+    for (motif, count) in motifs {
+        assert_eq!(count, 1, "motif {motif:?} should have exactly 1 IRR: {summary:#}");
+    }
 }

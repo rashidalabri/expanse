@@ -151,12 +151,17 @@ struct SinkRegion {
 
 pub fn run(args: FindSinksArgs) -> Result<()> {
     if is_cram_path(&args.input) && args.reference.is_none() {
-        bail!("--reference is required for CRAM input (input={})", args.input);
+        bail!(
+            "--reference is required for CRAM input (input={})",
+            args.input
+        );
     }
 
     let mut reader = match Url::parse(&args.input) {
-        Ok(url) => bam::Reader::from_url(&url).with_context(|| format!("failed to open input {}", args.input))?,
-        Err(_) => bam::Reader::from_path(&args.input).with_context(|| format!("failed to open input {}", args.input))?,
+        Ok(url) => bam::Reader::from_url(&url)
+            .with_context(|| format!("failed to open input {}", args.input))?,
+        Err(_) => bam::Reader::from_path(&args.input)
+            .with_context(|| format!("failed to open input {}", args.input))?,
     };
     if let Some(reference) = &args.reference {
         reader
@@ -164,7 +169,9 @@ pub fn run(args: FindSinksArgs) -> Result<()> {
             .with_context(|| format!("failed to set reference {reference:?} on reader"))?;
     }
     if args.threads > 1 {
-        reader.set_threads(args.threads).context("failed to set reader thread count")?;
+        reader
+            .set_threads(args.threads)
+            .context("failed to set reader thread count")?;
     }
 
     let mut cache: QnameCache = QnameCache::default();
@@ -266,14 +273,22 @@ fn classify(record: &Record, args: &FindSinksArgs) -> ReadKind {
     let mapq = record.mapq();
 
     if mapq <= args.max_irr_mapq
-        && let Some(motif) =
-            irr::classify_in_repeat_read(&record.seq().as_bytes(), record.qual(), args.motif_min_len, args.motif_max_len)
+        && let Some(motif) = irr::classify_in_repeat_read(
+            &record.seq().as_bytes(),
+            record.qual(),
+            args.motif_min_len,
+            args.motif_max_len,
+        )
     {
         // `.max(pos + 1)` guards against a degenerate empty CIGAR (no
         // ref-consuming ops), which would otherwise produce an inverted
         // empty region.
         let end = record.cigar().end_pos().max(record.pos() + 1);
-        let region = Region { tid: record.tid(), start: record.pos(), end };
+        let region = Region {
+            tid: record.tid(),
+            start: record.pos(),
+            end,
+        };
         return ReadKind::Irr(region, motif);
     }
 
@@ -301,8 +316,9 @@ fn merge_into_sinks(candidates: Vec<Candidate>) -> Vec<SinkRegion> {
             // `sinks` accumulates across motif groups, so the motif check
             // here matters: without it, the first region of a new group
             // could wrongly merge into the previous group's last entry.
-            let merges_into_last =
-                sinks.last().is_some_and(|last| last.motif == motif && last.tid == region.tid && region.start <= last.end);
+            let merges_into_last = sinks.last().is_some_and(|last| {
+                last.motif == motif && last.tid == region.tid && region.start <= last.end
+            });
 
             if merges_into_last {
                 let last = sinks.last_mut().expect("checked by merges_into_last");
@@ -329,17 +345,24 @@ fn merge_into_sinks(candidates: Vec<Candidate>) -> Vec<SinkRegion> {
 }
 
 fn write_bed(path: &PathBuf, sinks: &[SinkRegion], header: &HeaderView) -> Result<()> {
-    let file = std::fs::File::create(path).with_context(|| format!("failed to create output BED {path:?}"))?;
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create output BED {path:?}"))?;
     let mut writer = BufWriter::new(file);
 
     for sink in sinks {
         let chrom = String::from_utf8_lossy(header.tid2name(sink.tid as u32));
         let motif = String::from_utf8_lossy(&sink.motif);
-        writeln!(writer, "{chrom}\t{}\t{}\t{motif}\t{}\t{}", sink.start, sink.end, sink.irr_count, sink.anchored_count)
-            .with_context(|| format!("failed to write output BED {path:?}"))?;
+        writeln!(
+            writer,
+            "{chrom}\t{}\t{}\t{motif}\t{}\t{}",
+            sink.start, sink.end, sink.irr_count, sink.anchored_count
+        )
+        .with_context(|| format!("failed to write output BED {path:?}"))?;
     }
 
-    writer.flush().with_context(|| format!("failed to flush output BED {path:?}"))
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush output BED {path:?}"))
 }
 
 #[cfg(test)]
@@ -353,7 +376,16 @@ mod tests {
     fn sink_tuples(sinks: &[SinkRegion]) -> Vec<(i32, i64, i64, String, usize, usize)> {
         sinks
             .iter()
-            .map(|s| (s.tid, s.start, s.end, String::from_utf8_lossy(&s.motif).into_owned(), s.irr_count, s.anchored_count))
+            .map(|s| {
+                (
+                    s.tid,
+                    s.start,
+                    s.end,
+                    String::from_utf8_lossy(&s.motif).into_owned(),
+                    s.irr_count,
+                    s.anchored_count,
+                )
+            })
             .collect()
     }
 
@@ -366,48 +398,84 @@ mod tests {
         ];
 
         let sinks = merge_into_sinks(candidates);
-        assert_eq!(sink_tuples(&sinks), vec![(0, 100, 190, "CAG".to_string(), 2, 1), (0, 500, 550, "CAG".to_string(), 1, 0),]);
+        assert_eq!(
+            sink_tuples(&sinks),
+            vec![
+                (0, 100, 190, "CAG".to_string(), 2, 1),
+                (0, 500, 550, "CAG".to_string(), 1, 0),
+            ]
+        );
     }
 
     #[test]
     fn merge_into_sinks_touching_spans_merge() {
-        let candidates = vec![(r(0, 100, 150), b"CAG".to_vec(), false), (r(0, 150, 200), b"CAG".to_vec(), true)];
+        let candidates = vec![
+            (r(0, 100, 150), b"CAG".to_vec(), false),
+            (r(0, 150, 200), b"CAG".to_vec(), true),
+        ];
 
         let sinks = merge_into_sinks(candidates);
-        assert_eq!(sink_tuples(&sinks), vec![(0, 100, 200, "CAG".to_string(), 2, 1)]);
+        assert_eq!(
+            sink_tuples(&sinks),
+            vec![(0, 100, 200, "CAG".to_string(), 2, 1)]
+        );
     }
 
     #[test]
     fn merge_into_sinks_keeps_different_motifs_at_same_coordinates_separate() {
-        let candidates = vec![(r(0, 100, 150), b"CAG".to_vec(), false), (r(0, 100, 150), b"GATA".to_vec(), false)];
+        let candidates = vec![
+            (r(0, 100, 150), b"CAG".to_vec(), false),
+            (r(0, 100, 150), b"GATA".to_vec(), false),
+        ];
 
         let sinks = merge_into_sinks(candidates);
         let mut tuples = sink_tuples(&sinks);
         tuples.sort();
         assert_eq!(
             tuples,
-            vec![(0, 100, 150, "CAG".to_string(), 1, 0), (0, 100, 150, "GATA".to_string(), 1, 0)]
+            vec![
+                (0, 100, 150, "CAG".to_string(), 1, 0),
+                (0, 100, 150, "GATA".to_string(), 1, 0)
+            ]
         );
     }
 
     #[test]
     fn merge_into_sinks_keeps_different_contigs_separate() {
-        let candidates = vec![(r(0, 100, 150), b"CAG".to_vec(), false), (r(1, 100, 150), b"CAG".to_vec(), false)];
+        let candidates = vec![
+            (r(0, 100, 150), b"CAG".to_vec(), false),
+            (r(1, 100, 150), b"CAG".to_vec(), false),
+        ];
 
         let sinks = merge_into_sinks(candidates);
         let mut tuples = sink_tuples(&sinks);
         tuples.sort();
-        assert_eq!(tuples, vec![(0, 100, 150, "CAG".to_string(), 1, 0), (1, 100, 150, "CAG".to_string(), 1, 0)]);
+        assert_eq!(
+            tuples,
+            vec![
+                (0, 100, 150, "CAG".to_string(), 1, 0),
+                (1, 100, 150, "CAG".to_string(), 1, 0)
+            ]
+        );
     }
 
     #[test]
     fn merge_into_sinks_non_touching_spans_stay_separate() {
-        let candidates = vec![(r(0, 100, 150), b"CAG".to_vec(), false), (r(0, 151, 200), b"CAG".to_vec(), false)];
+        let candidates = vec![
+            (r(0, 100, 150), b"CAG".to_vec(), false),
+            (r(0, 151, 200), b"CAG".to_vec(), false),
+        ];
 
         let sinks = merge_into_sinks(candidates);
         let mut tuples = sink_tuples(&sinks);
         tuples.sort();
-        assert_eq!(tuples, vec![(0, 100, 150, "CAG".to_string(), 1, 0), (0, 151, 200, "CAG".to_string(), 1, 0)]);
+        assert_eq!(
+            tuples,
+            vec![
+                (0, 100, 150, "CAG".to_string(), 1, 0),
+                (0, 151, 200, "CAG".to_string(), 1, 0)
+            ]
+        );
     }
 
     #[test]

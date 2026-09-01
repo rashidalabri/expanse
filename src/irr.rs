@@ -35,6 +35,53 @@ pub fn classify_in_repeat_read(bases: &[u8], quals: &[u8], motif_min_len: u32, m
     }
 }
 
+/// Returns every canonical repeat unit (motif) that independently clears
+/// both the unit-frequency and IRR-score thresholds for this read. A read
+/// can plausibly satisfy more than one motif (e.g. a longer compound period
+/// that is itself a repetition of a shorter one also scores well), so
+/// unlike [`classify_in_repeat_read`] this doesn't collapse to a single
+/// "best" motif. Each returned motif is distinct; order is not significant.
+pub fn classify_in_repeat_read_all(
+    bases: &[u8],
+    quals: &[u8],
+    motif_min_len: u32,
+    motif_max_len: u32,
+) -> Vec<Vec<u8>> {
+    let smallest_period = motif_min_len.max(1) as usize;
+    let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
+
+    let mut motifs: Vec<Vec<u8>> = Vec::new();
+    for period in smallest_period..=largest_period {
+        if match_frequency_at_offset(period, bases) < MIN_UNIT_FREQUENCY {
+            continue;
+        }
+
+        let mut unit = extract_consensus_repeat_unit(period, bases);
+
+        const PERFECT_MATCH_FREQUENCY: f64 = 1.0;
+        let (reduction_min, reduction_max) = DEFAULT_REDUCTION_MOTIF_RANGE;
+        if let Some(reduced_period) =
+            smallest_frequent_period(PERFECT_MATCH_FREQUENCY, &unit, reduction_min, reduction_max)
+            && reduced_period != period
+        {
+            unit = extract_consensus_repeat_unit(reduced_period, &unit);
+        }
+
+        let canonical = compute_canonical_repeat_unit(&unit);
+        if canonical.is_empty() || canonical == b"N" || motifs.contains(&canonical) {
+            continue;
+        }
+
+        let units_shifts = shift_units(std::slice::from_ref(&canonical));
+        let score = match_repeat_rc(&units_shifts, bases, quals) / bases.len() as f64;
+        if score >= MIN_IRR_SCORE {
+            motifs.push(canonical);
+        }
+    }
+
+    motifs
+}
+
 // --- motif detection ---------------------------------------------------
 
 fn max_matches_at_offset(offset: usize, bases: &[u8]) -> usize {
@@ -380,5 +427,54 @@ mod tests {
     #[test]
     fn classify_in_repeat_read_rejects_n_bases() {
         assert_eq!(classify_in_repeat_read(b"NNNNN", &raw_quals("$$$$$"), 1, 20), None);
+    }
+
+    /// A read whose composition is 20 A's followed by a single G, repeated:
+    /// mostly-A with only rare G interruptions passes the homopolymer "A"
+    /// motif's thresholds despite not being a pure homopolymer, while the
+    /// exact 21bp repeat unit also passes on its own -- so this read
+    /// legitimately qualifies under two distinct, non-harmonic motifs
+    /// (unlike a pure homopolymer, where every candidate period reduces
+    /// back to the same single-base canonical unit).
+    fn mostly_a_with_rare_g() -> Vec<u8> {
+        let unit: Vec<u8> = (0..20).map(|_| b'A').chain(std::iter::once(b'G')).collect();
+        unit.iter().cloned().cycle().take(21 * 16).collect()
+    }
+
+    #[test]
+    fn classify_in_repeat_read_all_returns_single_motif_for_pure_repeat() {
+        let bases = "CAG".repeat(20).into_bytes();
+        let quals = vec![40u8; bases.len()];
+        assert_eq!(classify_in_repeat_read_all(&bases, &quals, 1, 20), vec![b"AGC".to_vec()]);
+    }
+
+    #[test]
+    fn classify_in_repeat_read_all_returns_empty_for_non_repetitive() {
+        let bases = b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA";
+        let quals = vec![40u8; bases.len()];
+        assert!(classify_in_repeat_read_all(bases, &quals, 1, 20).is_empty());
+    }
+
+    #[test]
+    fn classify_in_repeat_read_all_returns_multiple_distinct_motifs() {
+        let bases = mostly_a_with_rare_g();
+        let quals = vec![40u8; bases.len()];
+
+        let motifs = classify_in_repeat_read_all(&bases, &quals, 1, 30);
+
+        assert!(
+            motifs.contains(&b"A".to_vec()),
+            "expected the mostly-A homopolymer motif to qualify: {motifs:?}"
+        );
+        assert!(
+            motifs.iter().any(|m| m.len() == 21),
+            "expected the exact 21bp repeat unit to also qualify: {motifs:?}"
+        );
+        assert_eq!(motifs.len(), 2, "expected exactly these two distinct motifs, got {motifs:?}");
+
+        // The single-motif classifier only ever returns one of them.
+        let single = classify_in_repeat_read(&bases, &quals, 1, 30);
+        assert!(single.is_some());
+        assert!(motifs.contains(single.as_ref().unwrap()));
     }
 }
