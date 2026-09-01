@@ -74,7 +74,9 @@ pub enum OutputFormat {
 /// with its IRR support broken down by (canonical) motif. A read that
 /// qualifies under more than one motif is counted once in `irr_count` but
 /// once per motif in `motifs`, so the `motifs` values can sum to more than
-/// `irr_count`.
+/// `irr_count`. A motif key may contain IUPAC ambiguity codes (e.g. `GCN`,
+/// `AARRG`) at positions that are consistently mixed across repeat copies;
+/// see `irr::classify_in_repeat_read_all`.
 #[derive(Serialize, Debug)]
 struct AnchorRegionSummary {
     chrom: String,
