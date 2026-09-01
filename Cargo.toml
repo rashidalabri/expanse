@@ -16,10 +16,3 @@ url = "2.5"
 [profile.release]
 codegen-units = 1
 lto = "fat"
-
-[dev-dependencies]
-criterion = "0.8.2"
-
-[[bench]]
-name = "irr"
-harness = false

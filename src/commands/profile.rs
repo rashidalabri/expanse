@@ -176,6 +176,13 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         _ => None,
     };
 
+    let degenerate_limits = irr::DegenerateLimits {
+        mononucleotide: args.max_degenerate_mononucleotide,
+        dinucleotide: args.max_degenerate_dinucleotide,
+        trinucleotide: args.max_degenerate_trinucleotide,
+        other: args.max_degenerate_other,
+    };
+
     let mut candidate_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
     // Each surviving candidate's anchor (mate) location and every canonical
     // motif the candidate qualifies under, used to build the merged
@@ -211,10 +218,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
                 record.qual(),
                 args.motif_min_len,
                 args.motif_max_len,
-                args.max_degenerate_mononucleotide,
-                args.max_degenerate_dinucleotide,
-                args.max_degenerate_trinucleotide,
-                args.max_degenerate_other,
+                degenerate_limits,
             );
             if motifs.is_empty() {
                 continue;

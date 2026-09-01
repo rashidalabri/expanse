@@ -12,8 +12,7 @@
 //! outright -- separately configurable for mononucleotide, dinucleotide,
 //! trinucleotide, and longer motifs (see `max_degenerate_mononucleotide`
 //! /`max_degenerate_dinucleotide`/`max_degenerate_trinucleotide`
-//! /`max_degenerate_other` on
-//! [`classify_in_repeat_read`]/[`classify_in_repeat_read_all`]).
+//! /`max_degenerate_other` on [`classify_in_repeat_read_all`]).
 //!
 //! `bases` are expected to be uppercase decoded read sequence bytes (as
 //! returned by `rust_htslib::bam::record::Seq::as_bytes`), and `quals` are
@@ -41,8 +40,7 @@ const MIN_DEGENERACY_SAMPLES: u32 = 8;
 /// IUPAC ambiguity codes grouped by degeneracy tier (fewest represented
 /// bases first), each paired with the literal bases it represents. Used by
 /// [`extract_consensus_base_iupac`] to find the smallest code that covers
-/// enough of the observed bases at a position, and by [`iupac_matches`] to
-/// test whether an observed base satisfies one of these codes.
+/// enough of the observed bases at a position.
 const IUPAC_TIERS: [&[(u8, &[u8])]; 4] = [
     &[(b'A', b"A"), (b'C', b"C"), (b'G', b"G"), (b'T', b"T")],
     &[
@@ -60,16 +58,27 @@ const IUPAC_TIERS: [&[(u8, &[u8])]; 4] = [
 /// Does an observed literal base (`A`/`C`/`G`/`T`, or occasionally a
 /// sequencer no-call `N`) satisfy an IUPAC code from a repeat motif? A
 /// plain-letter code only matches itself; an ambiguity code matches any
-/// base in its represented set (see [`IUPAC_TIERS`]).
+/// base in its represented set. Called once per base per candidate motif
+/// while scoring (see [`score_chunk`]), so this checks the fixed IUPAC
+/// alphabet directly rather than scanning [`IUPAC_TIERS`].
 fn iupac_matches(observed: u8, code: u8) -> bool {
     if observed == code {
         return true;
     }
-    IUPAC_TIERS
-        .iter()
-        .flat_map(|tier| tier.iter())
-        .find(|&&(tier_code, _)| tier_code == code)
-        .is_some_and(|&(_, members)| members.contains(&observed))
+    match code {
+        b'R' => matches!(observed, b'A' | b'G'),
+        b'Y' => matches!(observed, b'C' | b'T'),
+        b'S' => matches!(observed, b'G' | b'C'),
+        b'W' => matches!(observed, b'A' | b'T'),
+        b'K' => matches!(observed, b'G' | b'T'),
+        b'M' => matches!(observed, b'A' | b'C'),
+        b'B' => matches!(observed, b'C' | b'G' | b'T'),
+        b'D' => matches!(observed, b'A' | b'G' | b'T'),
+        b'H' => matches!(observed, b'A' | b'C' | b'T'),
+        b'V' => matches!(observed, b'A' | b'C' | b'G'),
+        b'N' => matches!(observed, b'A' | b'C' | b'G' | b'T'),
+        _ => false,
+    }
 }
 
 /// Default shortest repeat-unit (motif) length to consider.
@@ -85,97 +94,64 @@ pub const DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE: u32 = 1;
 /// Default degenerate-position cap for any motif of 4bp or longer.
 pub const DEFAULT_MAX_DEGENERATE_OTHER: u32 = 2;
 
+/// Length-tiered caps on how many IUPAC-ambiguous positions a motif may
+/// have before [`classify_in_repeat_read_all`] rejects it (see
+/// [`exceeds_degenerate_limit`]). Mononucleotide (1bp), dinucleotide (2bp),
+/// and trinucleotide (3bp) motifs are short enough that even one or two
+/// degenerate positions dominate the whole motif, so each gets its own,
+/// stricter cap; every motif of 4bp or longer shares `other`.
+#[derive(Debug, Clone, Copy)]
+pub struct DegenerateLimits {
+    pub mononucleotide: u32,
+    pub dinucleotide: u32,
+    pub trinucleotide: u32,
+    pub other: u32,
+}
+
+impl Default for DegenerateLimits {
+    fn default() -> Self {
+        Self {
+            mononucleotide: DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+            dinucleotide: DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+            trinucleotide: DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+            other: DEFAULT_MAX_DEGENERATE_OTHER,
+        }
+    }
+}
+
 /// The number of `unit`'s positions that are an IUPAC ambiguity code
 /// rather than a plain A/C/G/T base.
 fn degenerate_count(unit: &[u8]) -> u32 {
     unit.iter().filter(|&&b| !matches!(b, b'A' | b'C' | b'G' | b'T')).count() as u32
 }
 
-/// Does `unit` have more degenerate positions than allowed for its length?
-/// Mononucleotide (1bp), dinucleotide (2bp), and trinucleotide (3bp)
-/// motifs are short enough that even one or two degenerate positions
-/// dominate the whole motif, so each gets its own, stricter cap; every
-/// motif of 4bp or longer shares `max_other`.
-fn exceeds_degenerate_limit(
-    unit: &[u8],
-    max_mononucleotide: u32,
-    max_dinucleotide: u32,
-    max_trinucleotide: u32,
-    max_other: u32,
-) -> bool {
+/// Does `unit` have more degenerate positions than `limits` allows for its
+/// length?
+fn exceeds_degenerate_limit(unit: &[u8], limits: DegenerateLimits) -> bool {
     let limit = match unit.len() {
-        1 => max_mononucleotide,
-        2 => max_dinucleotide,
-        3 => max_trinucleotide,
-        _ => max_other,
+        1 => limits.mononucleotide,
+        2 => limits.dinucleotide,
+        3 => limits.trinucleotide,
+        _ => limits.other,
     };
     degenerate_count(unit) > limit
-}
-
-/// Returns the canonical repeat unit if `bases` (paired with `quals`) look
-/// like an in-repeat read, `None` otherwise. The unit may contain IUPAC
-/// ambiguity codes at consistently-mixed positions (see the module docs),
-/// but is rejected if it has more degenerate positions than
-/// `max_degenerate_mononucleotide`/`max_degenerate_dinucleotide`/
-/// `max_degenerate_trinucleotide`/`max_degenerate_other` allow for its
-/// length (see [`exceeds_degenerate_limit`]).
-#[allow(clippy::too_many_arguments)]
-pub fn classify_in_repeat_read(
-    bases: &[u8],
-    quals: &[u8],
-    motif_min_len: u32,
-    motif_max_len: u32,
-    max_degenerate_mononucleotide: u32,
-    max_degenerate_dinucleotide: u32,
-    max_degenerate_trinucleotide: u32,
-    max_degenerate_other: u32,
-) -> Option<Vec<u8>> {
-    let unit =
-        compute_canonical_repeat_unit_with_frequency(MIN_UNIT_FREQUENCY, bases, quals, motif_min_len, motif_max_len)?;
-    if unit.is_empty()
-        || exceeds_degenerate_limit(
-            &unit,
-            max_degenerate_mononucleotide,
-            max_degenerate_dinucleotide,
-            max_degenerate_trinucleotide,
-            max_degenerate_other,
-        )
-    {
-        return None;
-    }
-
-    let units_shifts = shift_units(std::slice::from_ref(&unit));
-    let score = match_repeat_rc(&units_shifts, bases, quals) / bases.len() as f64;
-
-    if score >= MIN_IRR_SCORE {
-        Some(unit)
-    } else {
-        None
-    }
 }
 
 /// Returns every canonical repeat unit (motif) that independently clears
 /// both the unit-frequency and IRR-score thresholds for this read. A read
 /// can plausibly satisfy more than one motif (e.g. a longer compound period
-/// that is itself a repetition of a shorter one also scores well), so
-/// unlike [`classify_in_repeat_read`] this doesn't collapse to a single
-/// "best" motif. Each returned motif is distinct; order is not significant.
-/// A motif may contain IUPAC ambiguity codes at consistently-mixed
-/// positions (see the module docs), but is excluded if it has more
-/// degenerate positions than `max_degenerate_mononucleotide`/
-/// `max_degenerate_dinucleotide`/`max_degenerate_trinucleotide`/
-/// `max_degenerate_other` allow for its length (see
-/// [`exceeds_degenerate_limit`]).
-#[allow(clippy::too_many_arguments)]
+/// that is itself a repetition of a shorter one also scores well), so this
+/// doesn't collapse to a single "best" motif. Each returned motif is
+/// distinct; order is not significant. A motif may contain IUPAC ambiguity
+/// codes at consistently-mixed positions (see the module docs), but is
+/// excluded if it has more degenerate positions than `degenerate_limits`
+/// allows for its length (see [`exceeds_degenerate_limit`]).
 pub fn classify_in_repeat_read_all(
     bases: &[u8],
     quals: &[u8],
     motif_min_len: u32,
     motif_max_len: u32,
-    max_degenerate_mononucleotide: u32,
-    max_degenerate_dinucleotide: u32,
-    max_degenerate_trinucleotide: u32,
-    max_degenerate_other: u32,
+    degenerate_limits: DegenerateLimits,
 ) -> Vec<Vec<u8>> {
     let smallest_period = motif_min_len.max(1) as usize;
     let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
@@ -199,20 +175,14 @@ pub fn classify_in_repeat_read_all(
 
         let canonical = compute_canonical_repeat_unit(&unit);
         if canonical.is_empty()
-            || exceeds_degenerate_limit(
-                &canonical,
-                max_degenerate_mononucleotide,
-                max_degenerate_dinucleotide,
-                max_degenerate_trinucleotide,
-                max_degenerate_other,
-            )
+            || exceeds_degenerate_limit(&canonical, degenerate_limits)
             || motifs.contains(&canonical)
         {
             continue;
         }
 
-        let units_shifts = shift_units(std::slice::from_ref(&canonical));
-        let score = match_repeat_rc(&units_shifts, bases, quals) / bases.len() as f64;
+        let unit_shifts = shift_unit(&canonical);
+        let score = match_repeat_rc(&unit_shifts, bases, quals) / bases.len() as f64;
         if score >= MIN_IRR_SCORE {
             motifs.push(canonical);
         }
@@ -292,7 +262,7 @@ fn extract_consensus_repeat_unit(period: usize, bases: &[u8]) -> Vec<u8> {
 ///   toward a tier's coverage, so an otherwise-clean position doesn't get
 ///   marked ambiguous just because its noisy/low-quality observations
 ///   happen to disagree -- that kind of noise is what the quality-aware
-///   scoring in [`match_units`] already exists to tolerate, not something
+///   scoring in [`score_chunk`] already exists to tolerate, not something
 ///   the *motif* itself should absorb.
 /// - `period == 1` never escalates: a length-1 repeat unit is a homopolymer
 ///   by definition, and an "ambiguous homopolymer" covering 2+ bases is
@@ -385,94 +355,71 @@ fn compute_canonical_repeat_unit(unit: &[u8]) -> Vec<u8> {
     }
 }
 
-fn compute_canonical_repeat_unit_with_frequency(
-    min_frequency: f64,
-    bases: &[u8],
-    quals: &[u8],
-    motif_min_len: u32,
-    motif_max_len: u32,
-) -> Option<Vec<u8>> {
-    let period = smallest_frequent_period(min_frequency, bases, motif_min_len, motif_max_len)?;
-    let mut motif = extract_consensus_repeat_unit_iupac(period, bases, quals);
-
-    const PERFECT_MATCH_FREQUENCY: f64 = 1.0;
-    let (reduction_min, reduction_max) = DEFAULT_REDUCTION_MOTIF_RANGE;
-    if let Some(reduced_period) = smallest_frequent_period(PERFECT_MATCH_FREQUENCY, &motif, reduction_min, reduction_max)
-        && reduced_period != period
-    {
-        motif = extract_consensus_repeat_unit(reduced_period, &motif);
-    }
-
-    Some(compute_canonical_repeat_unit(&motif))
-}
-
 // --- quality-aware matching ----------------------------------------------
 
-fn shift_units(units: &[Vec<u8>]) -> Vec<Vec<Vec<u8>>> {
-    let unit_length = units[0].len();
-    let extended: Vec<Vec<u8>> = units
-        .iter()
-        .map(|unit| {
-            let mut doubled = unit.clone();
-            doubled.extend_from_slice(unit);
-            doubled
-        })
-        .collect();
-
-    (0..unit_length)
-        .map(|offset| extended.iter().map(|doubled| doubled[offset..offset + unit_length].to_vec()).collect())
-        .collect()
+/// Every cyclic rotation of `unit` (e.g. `"ATG"` -> `["ATG", "TGA", "GAT"]`),
+/// so a candidate motif can be scored against a read at every possible
+/// phase alignment (see [`best_score_across_shifts`]) -- the read's first
+/// base isn't necessarily the motif's first base.
+fn shift_unit(unit: &[u8]) -> Vec<Vec<u8>> {
+    let len = unit.len();
+    let mut doubled = unit.to_vec();
+    doubled.extend_from_slice(unit);
+    (0..len).map(|offset| doubled[offset..offset + len].to_vec()).collect()
 }
 
-fn match_units(units: &[Vec<u8>], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
+/// Scores one `unit`-length chunk against `unit`: +1 per IUPAC-matching
+/// position, -1 per confident mismatch, or +0.5 for a mismatch whose
+/// quality is below `min_baseq` (too uncertain to penalize as confidently
+/// wrong).
+fn score_chunk(unit: &[u8], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
     const MATCH_SCORE: f64 = 1.0;
     const LOWQUAL_MISMATCH_SCORE: f64 = 0.5;
     const MISMATCH_PENALTY: f64 = -1.0;
 
-    units
-        .iter()
-        .map(|unit| {
-            bases
-                .iter()
-                .zip(quals)
-                .zip(unit)
-                .map(|((&base, &qual), &unit_base)| {
-                    if iupac_matches(base, unit_base) {
-                        MATCH_SCORE
-                    } else if qual < min_baseq {
-                        LOWQUAL_MISMATCH_SCORE
-                    } else {
-                        MISMATCH_PENALTY
-                    }
-                })
-                .sum::<f64>()
-        })
-        .fold(f64::NEG_INFINITY, f64::max)
-}
-
-fn match_repeat(units: &[Vec<u8>], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
-    let unit_len = units[0].len();
     bases
-        .chunks(unit_len)
-        .zip(quals.chunks(unit_len))
-        .map(|(base_chunk, qual_chunk)| match_units(units, base_chunk, qual_chunk, min_baseq))
+        .iter()
+        .zip(quals)
+        .zip(unit)
+        .map(|((&base, &qual), &unit_base)| {
+            if iupac_matches(base, unit_base) {
+                MATCH_SCORE
+            } else if qual < min_baseq {
+                LOWQUAL_MISMATCH_SCORE
+            } else {
+                MISMATCH_PENALTY
+            }
+        })
         .sum()
 }
 
-fn match_repeat_with_shifts(units_shifts: &[Vec<Vec<u8>>], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
-    units_shifts
+/// Scores the whole read against `unit` repeated end to end: `bases`
+/// chunked into `unit.len()`-sized pieces, each scored independently and
+/// summed.
+fn score_repeat(unit: &[u8], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
+    bases
+        .chunks(unit.len())
+        .zip(quals.chunks(unit.len()))
+        .map(|(base_chunk, qual_chunk)| score_chunk(unit, base_chunk, qual_chunk, min_baseq))
+        .sum()
+}
+
+/// The best [`score_repeat`] across every rotation in `unit_shifts` (see
+/// [`shift_unit`]), since the read's phase relative to the motif is unknown.
+fn best_score_across_shifts(unit_shifts: &[Vec<u8>], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
+    unit_shifts
         .iter()
-        .map(|units_shift| match_repeat(units_shift, bases, quals, min_baseq))
+        .map(|shift| score_repeat(shift, bases, quals, min_baseq))
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
-fn match_repeat_rc(units_shifts: &[Vec<Vec<u8>>], bases: &[u8], quals: &[u8]) -> f64 {
-    let forward_score = match_repeat_with_shifts(units_shifts, bases, quals, MIN_BASE_QUALITY);
+fn match_repeat_rc(unit_shifts: &[Vec<u8>], bases: &[u8], quals: &[u8]) -> f64 {
+    let forward_score = best_score_across_shifts(unit_shifts, bases, quals, MIN_BASE_QUALITY);
 
     let bases_rc = reverse_complement(bases);
     let mut quals_rc = quals.to_vec();
     quals_rc.reverse();
-    let reverse_score = match_repeat_with_shifts(units_shifts, &bases_rc, &quals_rc, MIN_BASE_QUALITY);
+    let reverse_score = best_score_across_shifts(unit_shifts, &bases_rc, &quals_rc, MIN_BASE_QUALITY);
 
     forward_score.max(reverse_score)
 }
@@ -481,41 +428,10 @@ fn match_repeat_rc(units_shifts: &[Vec<Vec<u8>>], bases: &[u8], quals: &[u8]) ->
 mod tests {
     use super::*;
 
-    /// Test qualities are given as ASCII PHRED+33 (as if lifted straight
-    /// from a FASTQ/SAM text field); convert to the raw PHRED bytes our
-    /// functions expect.
-    fn raw_quals(ascii: &str) -> Vec<u8> {
-        ascii.bytes().map(|c| c - 33).collect()
-    }
-
-    /// `classify_in_repeat_read` at the default degenerate-position caps,
-    /// for tests that don't care about that parameter specifically.
-    fn classify_default(bases: &[u8], quals: &[u8], motif_min_len: u32, motif_max_len: u32) -> Option<Vec<u8>> {
-        classify_in_repeat_read(
-            bases,
-            quals,
-            motif_min_len,
-            motif_max_len,
-            DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_OTHER,
-        )
-    }
-
     /// `classify_in_repeat_read_all` at the default degenerate-position
     /// caps, for tests that don't care about that parameter specifically.
     fn classify_all_default(bases: &[u8], quals: &[u8], motif_min_len: u32, motif_max_len: u32) -> Vec<Vec<u8>> {
-        classify_in_repeat_read_all(
-            bases,
-            quals,
-            motif_min_len,
-            motif_max_len,
-            DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_OTHER,
-        )
+        classify_in_repeat_read_all(bases, quals, motif_min_len, motif_max_len, DegenerateLimits::default())
     }
 
     #[test]
@@ -585,99 +501,6 @@ mod tests {
         assert_eq!(compute_canonical_repeat_unit(b"GCC"), b"CCG");
     }
 
-    /// High, uniform per-base quality, for tests that don't care about
-    /// quality-gated degeneracy and just want the plain periodicity/
-    /// canonicalization behavior exercised.
-    fn hq(len: usize) -> Vec<u8> {
-        vec![40u8; len]
-    }
-
-    #[test]
-    fn compute_canonical_repeat_unit_with_frequency_typical() {
-        let bases = b"CGGCGCCGGCGG";
-        assert_eq!(
-            compute_canonical_repeat_unit_with_frequency(0.8, bases, &hq(bases.len()), 1, 20),
-            Some(b"CCG".to_vec())
-        );
-        assert_eq!(
-            compute_canonical_repeat_unit_with_frequency(0.85, bases, &hq(bases.len()), 1, 20),
-            None
-        );
-        let bases = b"ACCCCAACCCCAACCCCAACCCCAACCCCAACCCCA";
-        assert_eq!(
-            compute_canonical_repeat_unit_with_frequency(0.8, bases, &hq(bases.len()), 1, 20),
-            Some(b"AACCCC".to_vec())
-        );
-    }
-
-    #[test]
-    fn compute_canonical_repeat_unit_with_frequency_homopolymer() {
-        let bases = b"CCCCCCC";
-        assert_eq!(
-            compute_canonical_repeat_unit_with_frequency(1.0, bases, &hq(bases.len()), 1, 20),
-            Some(b"C".to_vec())
-        );
-    }
-
-    #[test]
-    fn classify_in_repeat_read_typical_cases() {
-        assert_eq!(
-            classify_default(b"CCCCC", &raw_quals("$$$$$"), 1, 20),
-            Some(b"C".to_vec())
-        );
-
-        assert_eq!(classify_default(b"AAAAACCCCC", &raw_quals("$$$$$$$$$$"), 1, 20), None);
-
-        let bases: &[u8] = concat!(
-            "TCCACCCACCTCACCCCCCCCCCCCCCCGCCCCCCCCCCACCCCCCCCGCCCCCCCCCCCGGCCCCCCACTCCCCCCCCCCGGTCCTCCCC",
-            "CCCCCCCACCCTCCCCCCCCGCCCCCCCCCCCCCCCCCCTCCCCCCCCCCCCCCCCCCC"
-        )
-        .as_bytes();
-        let quals = raw_quals(concat!(
-            "------7----7-----7-777-7-F<--777F777F<J-7--7-7-A7-AFJA<<A-<<-7--7A77---7A-77A77A7---7-7-",
-            "7--77-7-77-777---7<7A<A-7A)-)-<)7))77A<JJF))--A<F-)-<-)<---7<J"
-        ));
-        assert_eq!(classify_default(bases, &quals, 1, 70), None);
-
-        let bases: &[u8] = concat!(
-            "TCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTTCATTT",
-            "CATTTCATTTCATTTCATTTCATTTCTTTTTTTTTATTTTTTTTTATTTTATATCGGAT"
-        )
-        .as_bytes();
-        let quals = raw_quals(concat!(
-            "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
-            "(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((("
-        ));
-        assert_eq!(classify_default(bases, &quals, 1, 20), Some(b"AAATG".to_vec()));
-
-        let bases: &[u8] = concat!(
-            "CCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCCCGCCCCGCC",
-            "CCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCGCCCCGCCCCGCG"
-        )
-        .as_bytes();
-        let quals = raw_quals(concat!(
-            "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
-            "(((((((((((((((((((((((((((((((((((((((((((((((((((((((("
-        ));
-        assert_eq!(classify_default(bases, &quals, 1, 15), Some(b"CCCCGCCCCGCG".to_vec()));
-
-        let bases: &[u8] = concat!(
-            "GGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCG",
-            "GGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCGCGGGGCGGGGCG"
-        )
-        .as_bytes();
-        let quals = raw_quals(concat!(
-            "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((",
-            "(((((((((((((((((((((((((((((((((((((((((((((((((((((((("
-        ));
-        assert_eq!(classify_default(bases, &quals, 1, 20), Some(b"CCCCGCCCCGCG".to_vec()));
-    }
-
-    #[test]
-    fn classify_in_repeat_read_rejects_n_bases() {
-        assert_eq!(classify_default(b"NNNNN", &raw_quals("$$$$$"), 1, 20), None);
-    }
-
     /// A read whose composition is 20 A's followed by a single G, repeated:
     /// mostly-A with only rare G interruptions passes the homopolymer "A"
     /// motif's thresholds despite not being a pure homopolymer, while the
@@ -726,11 +549,6 @@ mod tests {
         // score threshold. That's expected now that degenerate calling
         // exists -- this test only cares that the two motifs it names
         // above are among whatever comes back.
-
-        // The single-motif classifier only ever returns one of them.
-        let single = classify_default(&bases, &quals, 1, 30);
-        assert!(single.is_some());
-        assert!(motifs.contains(single.as_ref().unwrap()));
     }
 
     // --- IUPAC degenerate-motif calling ---------------------------------
@@ -875,15 +693,7 @@ mod tests {
 
     #[test]
     fn exceeds_degenerate_limit_uses_length_specific_defaults() {
-        let defaults = |unit: &[u8]| {
-            exceeds_degenerate_limit(
-                unit,
-                DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-                DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-                DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-                DEFAULT_MAX_DEGENERATE_OTHER,
-            )
-        };
+        let defaults = |unit: &[u8]| exceeds_degenerate_limit(unit, DegenerateLimits::default());
 
         // Mononucleotide (1bp): default cap 0.
         assert!(!defaults(b"A"), "a clean mononucleotide motif should never be rejected");
@@ -943,10 +753,7 @@ mod tests {
             &quals,
             2,
             10,
-            DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-            DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-            3,
+            DegenerateLimits { other: 3, ..Default::default() },
         );
         let eight_mer = motifs.iter().find(|m| m.len() == 8);
         assert!(

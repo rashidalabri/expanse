@@ -30,23 +30,17 @@ fn non_repetitive_seq() -> Vec<u8> {
     b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA".to_vec()
 }
 
-/// The canonical motif `expanse::irr::classify_in_repeat_read` assigns to
-/// `seq`, used so tests assert against the real canonicalization instead of
-/// a hardcoded (and possibly wrong) guess at its output.
+/// The canonical motif `expanse::irr::classify_in_repeat_read_all` assigns
+/// to `seq`, used so tests assert against the real canonicalization instead
+/// of a hardcoded (and possibly wrong) guess at its output. `seq` is
+/// expected to be a clean, single-motif fixture, so exactly one motif
+/// should come back.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
-    let motif = expanse::irr::classify_in_repeat_read(
-        seq,
-        &quals,
-        2,
-        20,
-        expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
-    )
-    .expect("fixture sequence should classify as an IRR");
-    String::from_utf8(motif).expect("motif should be ASCII bases")
+    let motifs =
+        expanse::irr::classify_in_repeat_read_all(seq, &quals, 2, 20, expanse::irr::DegenerateLimits::default());
+    assert_eq!(motifs.len(), 1, "expected exactly one motif for this clean fixture, got {motifs:?}");
+    String::from_utf8(motifs.into_iter().next().unwrap()).expect("motif should be ASCII bases")
 }
 
 #[allow(clippy::too_many_arguments)]
