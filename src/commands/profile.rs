@@ -213,7 +213,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             if record.mapq() > args.max_irr_mapq {
                 continue;
             }
-            let motifs = irr::classify_in_repeat_read_all(
+            let motifs = irr::identify_repeat_motifs(
                 &record.seq().as_bytes(),
                 record.qual(),
                 args.motif_min_len,

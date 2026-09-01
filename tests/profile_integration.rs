@@ -8,7 +8,7 @@ use rust_htslib::bam::index::{self, Type};
 use rust_htslib::bam::record::{Cigar, CigarString};
 use rust_htslib::bam::{Format, Header, Read, Reader, Record, Writer};
 
-use expanse::commands::profile::{run, OutputFormat, ProfileArgs};
+use expanse::commands::profile::{OutputFormat, ProfileArgs, run};
 
 const PAIRED: u16 = 1;
 const MUNMAP: u16 = 8;
@@ -37,14 +37,32 @@ fn non_repetitive_seq() -> Vec<u8> {
 /// should come back.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
-    let motifs =
-        expanse::irr::classify_in_repeat_read_all(seq, &quals, 2, 20, expanse::irr::DegenerateLimits::default());
-    assert_eq!(motifs.len(), 1, "expected exactly one motif for this clean fixture, got {motifs:?}");
+    let motifs = expanse::irr::identify_repeat_motifs(
+        seq,
+        &quals,
+        2,
+        20,
+        expanse::irr::DegenerateLimits::default(),
+    );
+    assert_eq!(
+        motifs.len(),
+        1,
+        "expected exactly one motif for this clean fixture, got {motifs:?}"
+    );
     String::from_utf8(motifs.into_iter().next().unwrap()).expect("motif should be ASCII bases")
 }
 
 #[allow(clippy::too_many_arguments)]
-fn make_record(qname: &str, tid: i32, pos: i64, mapq: u8, flags: u16, mtid: i32, mpos: i64, seq: &[u8]) -> Record {
+fn make_record(
+    qname: &str,
+    tid: i32,
+    pos: i64,
+    mapq: u8,
+    flags: u16,
+    mtid: i32,
+    mpos: i64,
+    seq: &[u8],
+) -> Record {
     let mut record = Record::new();
     let qual = vec![40u8; seq.len()];
     let cigar = CigarString(vec![Cigar::Match(seq.len() as u32)]);
@@ -103,9 +121,27 @@ fn fixture_records() -> Vec<Record> {
 
     vec![
         make_record("irrIn", 0, 100, 10, PAIRED | READ1, 0, 5000, &irr),
-        make_record("irrUnmappedMate", 0, 105, 12, PAIRED | READ1 | MUNMAP, -1, -1, &irr),
+        make_record(
+            "irrUnmappedMate",
+            0,
+            105,
+            12,
+            PAIRED | READ1 | MUNMAP,
+            -1,
+            -1,
+            &irr,
+        ),
         make_record("highMapq", 0, 120, 60, PAIRED | READ1, 0, 6000, &irr),
-        make_record("nonRepetitive", 0, 140, 8, PAIRED | READ1, 0, 7000, &non_repetitive),
+        make_record(
+            "nonRepetitive",
+            0,
+            140,
+            8,
+            PAIRED | READ1,
+            0,
+            7000,
+            &non_repetitive,
+        ),
         make_record("outsideRegion", 0, 9000, 5, PAIRED | READ1, 0, 9500, &irr),
     ]
 }
@@ -218,25 +254,41 @@ fn profile_extracts_irr_candidates() {
         *counts.entry(qname.clone()).or_default() += 1;
     }
 
-    assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
-    assert_eq!(counts.get("irrIn"), Some(&1), "low-mapq IRR read inside the region should be written");
+    assert_eq!(
+        written.len(),
+        2,
+        "expected exactly 2 records, got {written:?}"
+    );
+    assert_eq!(
+        counts.get("irrIn"),
+        Some(&1),
+        "low-mapq IRR read inside the region should be written"
+    );
     assert_eq!(
         counts.get("irrUnmappedMate"),
         Some(&1),
         "an unmapped mate should no longer exclude an IRR candidate"
     );
-    assert!(!counts.contains_key("highMapq"), "high-mapq read should be excluded");
+    assert!(
+        !counts.contains_key("highMapq"),
+        "high-mapq read should be excluded"
+    );
     assert!(
         !counts.contains_key("nonRepetitive"),
         "low-mapq but non-repetitive read should be excluded by the IRR purity filter"
     );
-    assert!(!counts.contains_key("outsideRegion"), "out-of-region read should be excluded");
+    assert!(
+        !counts.contains_key("outsideRegion"),
+        "out-of-region read should be excluded"
+    );
 
     // The summary reports the *anchor* (mate) location, not the IRR read's
     // own location: only "irrIn" has a mapped mate (at 5000), so it's the
     // only entry, spanning [mate_pos, mate_pos + read_length).
-    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
     let regions = summary.as_array().expect("summary should be a JSON array");
     assert_eq!(
         regions.len(),
@@ -278,7 +330,10 @@ fn profile_writes_no_bam_output_by_default() {
 
     run(args).expect("profile run should succeed");
 
-    assert!(summary_path.exists(), "summary JSON should always be written");
+    assert!(
+        summary_path.exists(),
+        "summary JSON should always be written"
+    );
 }
 
 /// Same scenario as `profile_extracts_irr_candidates`, but against a CRAM
@@ -316,22 +371,38 @@ fn profile_extracts_irr_candidates_cram() {
         *counts.entry(qname.clone()).or_default() += 1;
     }
 
-    assert_eq!(written.len(), 2, "expected exactly 2 records, got {written:?}");
-    assert_eq!(counts.get("irrIn"), Some(&1), "low-mapq IRR read inside the region should be written");
+    assert_eq!(
+        written.len(),
+        2,
+        "expected exactly 2 records, got {written:?}"
+    );
+    assert_eq!(
+        counts.get("irrIn"),
+        Some(&1),
+        "low-mapq IRR read inside the region should be written"
+    );
     assert_eq!(
         counts.get("irrUnmappedMate"),
         Some(&1),
         "an unmapped mate should no longer exclude an IRR candidate"
     );
-    assert!(!counts.contains_key("highMapq"), "high-mapq read should be excluded");
+    assert!(
+        !counts.contains_key("highMapq"),
+        "high-mapq read should be excluded"
+    );
     assert!(
         !counts.contains_key("nonRepetitive"),
         "low-mapq but non-repetitive read should be excluded by the IRR purity filter"
     );
-    assert!(!counts.contains_key("outsideRegion"), "out-of-region read should be excluded");
+    assert!(
+        !counts.contains_key("outsideRegion"),
+        "out-of-region read should be excluded"
+    );
 
-    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
     let regions = summary.as_array().expect("summary should be a JSON array");
     assert_eq!(
         regions.len(),
@@ -414,20 +485,35 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
     let gata_motif = canonical_motif(&gata_seq());
     assert_ne!(cag_motif, gata_motif, "fixture motifs should be distinct");
 
-    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
-    let mut regions = summary.as_array().expect("summary should be a JSON array").clone();
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let mut regions = summary
+        .as_array()
+        .expect("summary should be a JSON array")
+        .clone();
     regions.sort_by_key(|region| region["start"].as_i64().unwrap());
 
-    assert_eq!(regions.len(), 2, "expected two separate anchor regions, got {summary:#}");
+    assert_eq!(
+        regions.len(),
+        2,
+        "expected two separate anchor regions, got {summary:#}"
+    );
 
     let near = &regions[0];
     assert_eq!(near["chrom"], "chr1");
     assert_eq!(near["start"], 3000);
     assert_eq!(near["end"], 3160);
     assert_eq!(near["irr_count"], 3);
-    assert_eq!(near["motifs"][&cag_motif], 2, "expected 2 CAG-motif IRRs: {summary:#}");
-    assert_eq!(near["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
+    assert_eq!(
+        near["motifs"][&cag_motif], 2,
+        "expected 2 CAG-motif IRRs: {summary:#}"
+    );
+    assert_eq!(
+        near["motifs"][&gata_motif], 1,
+        "expected 1 GATA-motif IRR: {summary:#}"
+    );
 
     let far = &regions[1];
     assert_eq!(far["chrom"], "chr1");
@@ -466,8 +552,10 @@ fn profile_summary_merges_anchors_within_custom_distance() {
     let cag_motif = canonical_motif(&irr_seq());
     let gata_motif = canonical_motif(&gata_seq());
 
-    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
     let regions = summary.as_array().expect("summary should be a JSON array");
 
     assert_eq!(
@@ -480,8 +568,14 @@ fn profile_summary_merges_anchors_within_custom_distance() {
     assert_eq!(region["start"], 3000);
     assert_eq!(region["end"], 4310);
     assert_eq!(region["irr_count"], 4);
-    assert_eq!(region["motifs"][&cag_motif], 3, "expected 3 CAG-motif IRRs: {summary:#}");
-    assert_eq!(region["motifs"][&gata_motif], 1, "expected 1 GATA-motif IRR: {summary:#}");
+    assert_eq!(
+        region["motifs"][&cag_motif], 3,
+        "expected 3 CAG-motif IRRs: {summary:#}"
+    );
+    assert_eq!(
+        region["motifs"][&gata_motif], 1,
+        "expected 1 GATA-motif IRR: {summary:#}"
+    );
 }
 
 /// A read whose composition is 20 A's followed by a single G, repeated:
@@ -507,7 +601,18 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
 
     {
         let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        writer.write(&make_record("multiMotif", 0, 60, 10, PAIRED | READ1, 0, 5000, &seq)).unwrap();
+        writer
+            .write(&make_record(
+                "multiMotif",
+                0,
+                60,
+                10,
+                PAIRED | READ1,
+                0,
+                5000,
+                &seq,
+            ))
+            .unwrap();
     }
     index::build(&bam_path, None, Type::Bai, 1).unwrap();
 
@@ -538,11 +643,17 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
 
     run(args).expect("profile run should succeed");
 
-    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
     let regions = summary.as_array().expect("summary should be a JSON array");
 
-    assert_eq!(regions.len(), 1, "expected a single anchor region, got {summary:#}");
+    assert_eq!(
+        regions.len(),
+        1,
+        "expected a single anchor region, got {summary:#}"
+    );
     let region = &regions[0];
 
     assert_eq!(
@@ -557,13 +668,18 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
     // (R-containing) motif. That doesn't matter for what this test checks
     // -- every motif entry a single read contributes to must show count 1,
     // never more, no matter how many entries there are.
-    let motifs = region["motifs"].as_object().expect("motifs should be a JSON object");
+    let motifs = region["motifs"]
+        .as_object()
+        .expect("motifs should be a JSON object");
     assert!(
         motifs.len() >= 2,
         "expected at least the read's two originally-intended qualifying motifs: {summary:#}"
     );
     for (motif, count) in motifs {
-        assert_eq!(count, 1, "motif {motif:?} should have exactly 1 IRR: {summary:#}");
+        assert_eq!(
+            count, 1,
+            "motif {motif:?} should have exactly 1 IRR: {summary:#}"
+        );
     }
 }
 
@@ -580,7 +696,18 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
 
     {
         let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        writer.write(&make_record("iupacMotif", 0, 60, 10, PAIRED | READ1, 0, 5000, &seq)).unwrap();
+        writer
+            .write(&make_record(
+                "iupacMotif",
+                0,
+                60,
+                10,
+                PAIRED | READ1,
+                0,
+                5000,
+                &seq,
+            ))
+            .unwrap();
     }
     index::build(&bam_path, None, Type::Bai, 1).unwrap();
 
@@ -611,12 +738,20 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
 
     run(args).expect("profile run should succeed");
 
-    let summary_text = std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value = serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
     let regions = summary.as_array().expect("summary should be a JSON array");
-    let motifs = regions[0]["motifs"].as_object().expect("motifs should be a JSON object");
+    let motifs = regions[0]["motifs"]
+        .as_object()
+        .expect("motifs should be a JSON object");
 
-    let is_ambiguous = |motif: &str| motif.bytes().any(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'));
+    let is_ambiguous = |motif: &str| {
+        motif
+            .bytes()
+            .any(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
+    };
     assert!(
         motifs.keys().any(|motif| is_ambiguous(motif)),
         "expected at least one motif with an IUPAC ambiguity code in the summary: {summary:#}"
