@@ -241,7 +241,7 @@ fn profile_extracts_irr_candidates() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -325,7 +325,7 @@ fn profile_writes_no_bam_output_by_default() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -362,7 +362,7 @@ fn profile_extracts_irr_candidates_cram() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
@@ -480,7 +480,7 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -547,7 +547,7 @@ fn profile_summary_drops_anchor_regions_mostly_overlapping_sink_regions() {
     // Fully covers the "far" anchor region (chr1:4160-4310) but leaves the
     // "near" one (chr1:3000-3160) untouched, so only "far" should be
     // dropped for exceeding the default 0.8 overlap fraction.
-    let full_sink_bed_path = build_sink_bed(&[("chr1", 4000, 4400)]);
+    let exclude_bed_path = build_sink_bed(&[("chr1", 4000, 4400)]);
 
     let args = ProfileArgs {
         sink_bed: bed_path,
@@ -563,7 +563,7 @@ fn profile_summary_drops_anchor_regions_mostly_overlapping_sink_regions() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: Some(full_sink_bed_path),
+        exclude_bed: Some(exclude_bed_path),
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -595,7 +595,7 @@ fn profile_summary_keeps_anchor_regions_below_sink_overlap_fraction() {
     // Overlaps only 50bp of the 150bp-wide "far" anchor region
     // (chr1:4160-4310), i.e. a 1/3 overlap fraction -- below the default
     // 0.8 threshold, so the region should be kept.
-    let full_sink_bed_path = build_sink_bed(&[("chr1", 4260, 4400)]);
+    let exclude_bed_path = build_sink_bed(&[("chr1", 4260, 4400)]);
 
     let args = ProfileArgs {
         sink_bed: bed_path,
@@ -611,7 +611,7 @@ fn profile_summary_keeps_anchor_regions_below_sink_overlap_fraction() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: Some(full_sink_bed_path),
+        exclude_bed: Some(exclude_bed_path),
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -636,7 +636,7 @@ fn profile_summary_keeps_anchor_regions_below_sink_overlap_fraction() {
 /// A candidate whose mate lands inside the scanning `--sink-bed` region itself
 /// (chr1:50-150), so its anchor region ([mpos, mpos+read_length)) falls
 /// entirely within it -- used to exercise the default sink-region behavior
-/// (falling back to `--sink-bed` when `--full-sink-bed` isn't given).
+/// (falling back to `--sink-bed` when `--exclude-bed` isn't given).
 fn build_self_overlapping_anchor_bam() -> (PathBuf, PathBuf) {
     let bam_path = scratch_path("self_overlap_fixture.bam");
     let header = fixture_header();
@@ -666,7 +666,7 @@ fn build_self_overlapping_anchor_bam() -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn profile_summary_defaults_sink_regions_to_bed_when_full_sink_bed_omitted() {
+fn profile_summary_defaults_sink_regions_to_bed_when_exclude_bed_omitted() {
     let (bam_path, bed_path) = build_self_overlapping_anchor_bam();
     let summary_path = scratch_path("summary_default_sink.json");
 
@@ -684,9 +684,9 @@ fn profile_summary_defaults_sink_regions_to_bed_when_full_sink_bed_omitted() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 50,
-        // No --full-sink-bed: sink regions should default to --sink-bed itself
+        // No --exclude-bed: sink regions should default to --sink-bed itself
         // (chr1:50-150), which fully contains this anchor ([70, 120)).
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -710,11 +710,11 @@ fn profile_summary_defaults_sink_regions_to_bed_when_full_sink_bed_omitted() {
 }
 
 #[test]
-fn profile_summary_full_sink_bed_overrides_default_bed_fallback() {
+fn profile_summary_exclude_bed_overrides_default_bed_fallback() {
     let (bam_path, bed_path) = build_self_overlapping_anchor_bam();
     let summary_path = scratch_path("summary_full_sink_override.json");
     // Doesn't overlap the anchor region ([70, 120)) at all, unlike --sink-bed.
-    let full_sink_bed_path = build_sink_bed(&[("chr1", 5000, 5100)]);
+    let exclude_bed_path = build_sink_bed(&[("chr1", 5000, 5100)]);
 
     let args = ProfileArgs {
         sink_bed: bed_path,
@@ -730,7 +730,7 @@ fn profile_summary_full_sink_bed_overrides_default_bed_fallback() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 50,
-        full_sink_bed: Some(full_sink_bed_path),
+        exclude_bed: Some(exclude_bed_path),
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -748,7 +748,7 @@ fn profile_summary_full_sink_bed_overrides_default_bed_fallback() {
     assert_eq!(
         regions.len(),
         1,
-        "expected the anchor region to survive once --full-sink-bed overrides the --sink-bed \
+        "expected the anchor region to survive once --exclude-bed overrides the --sink-bed \
          fallback, got {summary:#}"
     );
 }
@@ -772,7 +772,7 @@ fn profile_summary_merges_anchors_within_custom_distance() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 3000,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -868,7 +868,7 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
@@ -965,7 +965,7 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
-        full_sink_bed: None,
+        exclude_bed: None,
         sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,

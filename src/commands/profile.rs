@@ -15,7 +15,7 @@ use crate::irr;
 pub struct ProfileArgs {
     /// BED file of IRR-mapping regions to scan for candidate low-mapq
     /// reads. Also used as the default sink regions for the `--summary`
-    /// removal step; see `--full-sink-bed`.
+    /// removal step; see `--exclude-bed`.
     #[arg(long)]
     pub sink_bed: PathBuf,
 
@@ -26,7 +26,7 @@ pub struct ProfileArgs {
     /// JSON summary output path: for each merged anchor region, its
     /// coordinates (0-based, half-open) and a breakdown of IRR counts by
     /// motif. Always written. Anchor regions excluded by the sink-region
-    /// check (`--full-sink-bed` / `--sink-overlap-fraction`) are omitted.
+    /// check (`--exclude-bed` / `--sink-overlap-fraction`) are omitted.
     #[arg(long)]
     pub summary: PathBuf,
 
@@ -85,10 +85,10 @@ pub struct ProfileArgs {
     /// `--sink-bed`. When omitted, `--sink-bed` itself is used as the sink
     /// regions.
     #[arg(long)]
-    pub full_sink_bed: Option<PathBuf>,
+    pub exclude_bed: Option<PathBuf>,
 
     /// Fraction of a merged anchor region's length that must overlap the
-    /// sink regions (`--full-sink-bed`, or `--sink-bed` if that's not
+    /// sink regions (`--exclude-bed`, or `--sink-bed` if that's not
     /// given) for that anchor region to be excluded from `--summary`.
     #[arg(long, default_value_t = 0.8)]
     pub sink_overlap_fraction: f64,
@@ -176,10 +176,10 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
     // Sink regions used only for the --summary removal step below; IRR
     // scanning above always fetches from `bed_fetch_regions` regardless.
-    let sink_regions = match &args.full_sink_bed {
-        Some(full_sink_bed) => {
-            let regions = bed::parse_bed(full_sink_bed, reader.header())
-                .with_context(|| format!("failed to parse sink BED file {full_sink_bed:?}"))?;
+    let sink_regions = match &args.exclude_bed {
+        Some(exclude_bed) => {
+            let regions = bed::parse_bed(exclude_bed, reader.header())
+                .with_context(|| format!("failed to parse sink BED file {exclude_bed:?}"))?;
             bed::merge_regions(&regions)
         }
         None => bed_fetch_regions.clone(),
