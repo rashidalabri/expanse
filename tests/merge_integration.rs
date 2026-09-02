@@ -38,8 +38,7 @@ fn read_merged(path: &PathBuf) -> Vec<serde_json::Value> {
 }
 
 /// Two samples with overlapping-ish loci on the same locus should merge
-/// into one, aggregating `irr_count`/`motifs` while keeping a per-sample
-/// breakdown.
+/// into one, with `irr_count`/`motifs` broken out per sample.
 #[test]
 fn merge_combines_nearby_loci_across_samples() {
     let sample_a = write_summary(
@@ -67,11 +66,11 @@ fn merge_combines_nearby_loci_across_samples() {
     assert_eq!(locus["chrom"], "chr1");
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 1200);
-    assert_eq!(locus["samples"]["sampleA"]["irr_count"], 5);
-    assert_eq!(locus["samples"]["sampleA"]["motifs"]["CAG"], 5);
-    assert_eq!(locus["samples"]["sampleB"]["irr_count"], 3);
-    assert_eq!(locus["samples"]["sampleB"]["motifs"]["CAG"], 2);
-    assert_eq!(locus["samples"]["sampleB"]["motifs"]["GATA"], 1);
+    assert_eq!(locus["irr_count"]["sampleA"], 5);
+    assert_eq!(locus["irr_count"]["sampleB"], 3);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 5);
+    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 2);
+    assert_eq!(locus["motifs"]["GATA"]["sampleB"], 1);
 }
 
 /// Loci far enough apart should stay as separate merged loci.
@@ -147,12 +146,12 @@ fn merge_chains_transitively_across_batch_boundaries() {
     let locus = &merged[0];
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 2300);
-    assert_eq!(locus["samples"]["sampleA"]["irr_count"], 1);
-    assert_eq!(locus["samples"]["sampleA"]["motifs"]["CAG"], 1);
-    assert_eq!(locus["samples"]["sampleB"]["irr_count"], 2);
-    assert_eq!(locus["samples"]["sampleB"]["motifs"]["CAG"], 2);
-    assert_eq!(locus["samples"]["sampleC"]["irr_count"], 4);
-    assert_eq!(locus["samples"]["sampleC"]["motifs"]["CAG"], 4);
+    assert_eq!(locus["irr_count"]["sampleA"], 1);
+    assert_eq!(locus["irr_count"]["sampleB"], 2);
+    assert_eq!(locus["irr_count"]["sampleC"], 4);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 1);
+    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 2);
+    assert_eq!(locus["motifs"]["CAG"]["sampleC"], 4);
 }
 
 /// The same three-sample fixture as the chaining test above, but run with
@@ -191,9 +190,9 @@ fn merge_result_is_independent_of_batch_size() {
     let locus = &merged[0];
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 2300);
-    assert_eq!(locus["samples"]["sampleA"]["irr_count"], 1);
-    assert_eq!(locus["samples"]["sampleB"]["irr_count"], 2);
-    assert_eq!(locus["samples"]["sampleC"]["irr_count"], 4);
+    assert_eq!(locus["irr_count"]["sampleA"], 1);
+    assert_eq!(locus["irr_count"]["sampleB"], 2);
+    assert_eq!(locus["irr_count"]["sampleC"], 4);
 }
 
 /// Distinct contigs must never be bridged together, no matter how the
@@ -269,10 +268,10 @@ fn merge_sums_same_sample_contributions_bridged_across_batches() {
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 2300);
     assert_eq!(
-        locus["samples"]["sampleA"]["irr_count"], 5,
+        locus["irr_count"]["sampleA"], 5,
         "sampleA's two separate contributions (1 + 4) should be summed: {merged:#?}"
     );
-    assert_eq!(locus["samples"]["sampleA"]["motifs"]["CAG"], 5);
-    assert_eq!(locus["samples"]["sampleB"]["irr_count"], 2);
-    assert_eq!(locus["samples"]["sampleB"]["motifs"]["GATA"], 2);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 5);
+    assert_eq!(locus["irr_count"]["sampleB"], 2);
+    assert_eq!(locus["motifs"]["GATA"]["sampleB"], 2);
 }
