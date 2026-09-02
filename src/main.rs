@@ -17,6 +17,7 @@ fn main() {
     let result = match cli.command {
         Commands::Profile(args) => commands::profile::run(args),
         Commands::Merge(args) => commands::merge::run(args),
+        Commands::Sinks(args) => commands::sinks::run(args),
     };
 
     if let Err(err) = result {
