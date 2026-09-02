@@ -14,8 +14,8 @@ use crate::irr;
 #[derive(Args, Debug)]
 pub struct ProfileArgs {
     /// BED file of IRR-mapping regions to scan for candidate low-mapq
-    /// reads. Also used as the default sink regions for the `--summary`
-    /// removal step; see `--exclude-bed`.
+    /// reads. Always also used as sink regions for the `--summary` removal
+    /// step; see `--exclude-bed`.
     #[arg(long)]
     pub sink_bed: PathBuf,
 
@@ -77,19 +77,19 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = 150)]
     pub read_length: i64,
 
-    /// Optional BED file of "sink" regions (e.g. known problematic loci) to
-    /// check merged anchor regions against for `--summary`: any merged
-    /// anchor region that overlaps sink regions by more than
-    /// `--exclude-overlap-fraction` of its own length is dropped from the
-    /// output. Used only for this removal step -- IRR scanning always uses
-    /// `--sink-bed`. When omitted, `--sink-bed` itself is used as the sink
-    /// regions.
+    /// Optional BED file of additional "sink" regions (e.g. known
+    /// problematic loci) to check merged anchor regions against for
+    /// `--summary`, on top of `--sink-bed` (which is always included): any
+    /// merged anchor region that overlaps the combined sink regions by more
+    /// than `--exclude-overlap-fraction` of its own length is dropped from
+    /// the output. Used only for this removal step -- IRR scanning always
+    /// uses `--sink-bed` alone.
     #[arg(long)]
     pub exclude_bed: Option<PathBuf>,
 
     /// Fraction of a merged anchor region's length that must overlap the
-    /// sink regions (`--exclude-bed`, or `--sink-bed` if that's not
-    /// given) for that anchor region to be excluded from `--summary`.
+    /// combined sink regions (`--sink-bed`, plus `--exclude-bed` if given)
+    /// for that anchor region to be excluded from `--summary`.
     #[arg(long, default_value_t = 0.8)]
     pub exclude_overlap_fraction: f64,
 
@@ -176,14 +176,15 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
     // Sink regions used only for the --summary removal step below; IRR
     // scanning above always fetches from `bed_fetch_regions` regardless.
-    let sink_regions = match &args.exclude_bed {
-        Some(exclude_bed) => {
-            let regions = bed::parse_bed(exclude_bed, reader.header())
-                .with_context(|| format!("failed to parse sink BED file {exclude_bed:?}"))?;
-            bed::merge_regions(&regions)
-        }
-        None => bed_fetch_regions.clone(),
-    };
+    // `--sink-bed` is always included, so an anchor region is dropped if it
+    // overlaps it too much even when `--exclude-bed` is also given.
+    let mut sink_source_regions = bed_regions.clone();
+    if let Some(exclude_bed) = &args.exclude_bed {
+        let regions = bed::parse_bed(exclude_bed, reader.header())
+            .with_context(|| format!("failed to parse sink BED file {exclude_bed:?}"))?;
+        sink_source_regions.extend(regions);
+    }
+    let sink_regions = bed::merge_regions(&sink_source_regions);
 
     let mut writer = match (&args.output, resolved_output_format) {
         (Some(output_path), Some(format)) => {

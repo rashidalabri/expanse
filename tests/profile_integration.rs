@@ -635,8 +635,8 @@ fn profile_summary_keeps_anchor_regions_below_exclude_overlap_fraction() {
 
 /// A candidate whose mate lands inside the scanning `--sink-bed` region itself
 /// (chr1:50-150), so its anchor region ([mpos, mpos+read_length)) falls
-/// entirely within it -- used to exercise the default sink-region behavior
-/// (falling back to `--sink-bed` when `--exclude-bed` isn't given).
+/// entirely within it -- used to exercise `--sink-bed`'s always-on sink-region
+/// behavior.
 fn build_self_overlapping_anchor_bam() -> (PathBuf, PathBuf) {
     let bam_path = scratch_path("self_overlap_fixture.bam");
     let header = fixture_header();
@@ -666,7 +666,7 @@ fn build_self_overlapping_anchor_bam() -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn profile_summary_defaults_sink_regions_to_bed_when_exclude_bed_omitted() {
+fn profile_summary_drops_anchor_regions_overlapping_sink_bed() {
     let (bam_path, bed_path) = build_self_overlapping_anchor_bam();
     let summary_path = scratch_path("summary_default_sink.json");
 
@@ -684,8 +684,8 @@ fn profile_summary_defaults_sink_regions_to_bed_when_exclude_bed_omitted() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 50,
-        // No --exclude-bed: sink regions should default to --sink-bed itself
-        // (chr1:50-150), which fully contains this anchor ([70, 120)).
+        // No --exclude-bed: --sink-bed alone (chr1:50-150) is always used
+        // as a sink region and fully contains this anchor ([70, 120)).
         exclude_bed: None,
         exclude_overlap_fraction: 0.8,
         reference: None,
@@ -704,16 +704,18 @@ fn profile_summary_defaults_sink_regions_to_bed_when_exclude_bed_omitted() {
     assert_eq!(
         regions.len(),
         0,
-        "expected the anchor region to be dropped against the default (--sink-bed) sink regions, \
+        "expected the anchor region to be dropped against --sink-bed's sink regions, \
          got {summary:#}"
     );
 }
 
 #[test]
-fn profile_summary_exclude_bed_overrides_default_bed_fallback() {
+fn profile_summary_exclude_bed_exclusion_is_additive_to_sink_bed() {
     let (bam_path, bed_path) = build_self_overlapping_anchor_bam();
-    let summary_path = scratch_path("summary_full_sink_override.json");
-    // Doesn't overlap the anchor region ([70, 120)) at all, unlike --sink-bed.
+    let summary_path = scratch_path("summary_sink_and_exclude.json");
+    // Doesn't overlap the anchor region ([70, 120)) at all -- --sink-bed
+    // (chr1:50-150) alone should still be enough to drop it, since
+    // --exclude-bed only ever adds exclusions, never replaces --sink-bed's.
     let exclude_bed_path = build_sink_bed(&[("chr1", 5000, 5100)]);
 
     let args = ProfileArgs {
@@ -747,9 +749,9 @@ fn profile_summary_exclude_bed_overrides_default_bed_fallback() {
 
     assert_eq!(
         regions.len(),
-        1,
-        "expected the anchor region to survive once --exclude-bed overrides the --sink-bed \
-         fallback, got {summary:#}"
+        0,
+        "expected the anchor region to still be dropped against --sink-bed even though \
+         --exclude-bed doesn't cover it, got {summary:#}"
     );
 }
 
