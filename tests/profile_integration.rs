@@ -228,7 +228,7 @@ fn profile_extracts_irr_candidates() {
     let summary_path = scratch_path("summary.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: Some(output_path.clone()),
@@ -241,6 +241,8 @@ fn profile_extracts_irr_candidates() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -310,7 +312,7 @@ fn profile_writes_no_bam_output_by_default() {
     let summary_path = scratch_path("summary_no_output.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: None,
@@ -323,6 +325,8 @@ fn profile_writes_no_bam_output_by_default() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -345,7 +349,7 @@ fn profile_extracts_irr_candidates_cram() {
     let summary_path = scratch_path("summary_cram.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: cram_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: Some(output_path.clone()),
@@ -358,6 +362,8 @@ fn profile_extracts_irr_candidates_cram() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
         threads: 1,
@@ -461,7 +467,7 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
     let summary_path = scratch_path("summary_distant.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: None,
@@ -474,6 +480,8 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -523,13 +531,235 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
     assert_eq!(far["motifs"][&cag_motif], 1);
 }
 
+fn build_sink_bed(entries: &[(&str, i64, i64)]) -> PathBuf {
+    let bed_path = scratch_path("sink.bed");
+    let mut bed_file = File::create(&bed_path).unwrap();
+    for (chrom, start, end) in entries {
+        writeln!(bed_file, "{chrom}\t{start}\t{end}").unwrap();
+    }
+    bed_path
+}
+
+#[test]
+fn profile_summary_drops_anchor_regions_mostly_overlapping_sink_regions() {
+    let (bam_path, bed_path) = build_summary_fixture_bam();
+    let summary_path = scratch_path("summary_sink_excluded.json");
+    // Fully covers the "far" anchor region (chr1:4160-4310) but leaves the
+    // "near" one (chr1:3000-3160) untouched, so only "far" should be
+    // dropped for exceeding the default 0.8 overlap fraction.
+    let full_sink_bed_path = build_sink_bed(&[("chr1", 4000, 4400)]);
+
+    let args = ProfileArgs {
+        sink_bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        summary: summary_path.clone(),
+        output: None,
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
+        anchor_merge_distance: 500,
+        read_length: 150,
+        full_sink_bed: Some(full_sink_bed_path),
+        sink_overlap_fraction: 0.8,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(
+        regions.len(),
+        1,
+        "expected only the non-sink-overlapping anchor region, got {summary:#}"
+    );
+    assert_eq!(regions[0]["chrom"], "chr1");
+    assert_eq!(regions[0]["start"], 3000);
+    assert_eq!(regions[0]["end"], 3160);
+}
+
+#[test]
+fn profile_summary_keeps_anchor_regions_below_sink_overlap_fraction() {
+    let (bam_path, bed_path) = build_summary_fixture_bam();
+    let summary_path = scratch_path("summary_sink_partial.json");
+    // Overlaps only 50bp of the 150bp-wide "far" anchor region
+    // (chr1:4160-4310), i.e. a 1/3 overlap fraction -- below the default
+    // 0.8 threshold, so the region should be kept.
+    let full_sink_bed_path = build_sink_bed(&[("chr1", 4260, 4400)]);
+
+    let args = ProfileArgs {
+        sink_bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        summary: summary_path.clone(),
+        output: None,
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
+        anchor_merge_distance: 500,
+        read_length: 150,
+        full_sink_bed: Some(full_sink_bed_path),
+        sink_overlap_fraction: 0.8,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(
+        regions.len(),
+        2,
+        "expected both anchor regions to survive a below-threshold overlap, got {summary:#}"
+    );
+}
+
+/// A candidate whose mate lands inside the scanning `--sink-bed` region itself
+/// (chr1:50-150), so its anchor region ([mpos, mpos+read_length)) falls
+/// entirely within it -- used to exercise the default sink-region behavior
+/// (falling back to `--sink-bed` when `--full-sink-bed` isn't given).
+fn build_self_overlapping_anchor_bam() -> (PathBuf, PathBuf) {
+    let bam_path = scratch_path("self_overlap_fixture.bam");
+    let header = fixture_header();
+    let irr = irr_seq();
+
+    let records = vec![make_record(
+        "irrSelfOverlap",
+        0,
+        60,
+        10,
+        PAIRED | READ1,
+        0,
+        70,
+        &irr,
+    )];
+
+    {
+        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
+        for record in &records {
+            writer.write(record).unwrap();
+        }
+    }
+
+    index::build(&bam_path, None, Type::Bai, 1).unwrap();
+
+    (bam_path, build_fixture_bed())
+}
+
+#[test]
+fn profile_summary_defaults_sink_regions_to_bed_when_full_sink_bed_omitted() {
+    let (bam_path, bed_path) = build_self_overlapping_anchor_bam();
+    let summary_path = scratch_path("summary_default_sink.json");
+
+    let args = ProfileArgs {
+        sink_bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        summary: summary_path.clone(),
+        output: None,
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
+        anchor_merge_distance: 500,
+        read_length: 50,
+        // No --full-sink-bed: sink regions should default to --sink-bed itself
+        // (chr1:50-150), which fully contains this anchor ([70, 120)).
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(
+        regions.len(),
+        0,
+        "expected the anchor region to be dropped against the default (--sink-bed) sink regions, \
+         got {summary:#}"
+    );
+}
+
+#[test]
+fn profile_summary_full_sink_bed_overrides_default_bed_fallback() {
+    let (bam_path, bed_path) = build_self_overlapping_anchor_bam();
+    let summary_path = scratch_path("summary_full_sink_override.json");
+    // Doesn't overlap the anchor region ([70, 120)) at all, unlike --sink-bed.
+    let full_sink_bed_path = build_sink_bed(&[("chr1", 5000, 5100)]);
+
+    let args = ProfileArgs {
+        sink_bed: bed_path,
+        input: bam_path.to_str().unwrap().to_string(),
+        summary: summary_path.clone(),
+        output: None,
+        max_irr_mapq: 40,
+        motif_min_len: 2,
+        motif_max_len: 20,
+        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
+        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
+        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
+        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
+        anchor_merge_distance: 500,
+        read_length: 50,
+        full_sink_bed: Some(full_sink_bed_path),
+        sink_overlap_fraction: 0.8,
+        reference: None,
+        output_format: None,
+        threads: 1,
+    };
+
+    run(args).expect("profile run should succeed");
+
+    let summary_text =
+        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
+    let regions = summary.as_array().expect("summary should be a JSON array");
+
+    assert_eq!(
+        regions.len(),
+        1,
+        "expected the anchor region to survive once --full-sink-bed overrides the --sink-bed \
+         fallback, got {summary:#}"
+    );
+}
+
 #[test]
 fn profile_summary_merges_anchors_within_custom_distance() {
     let (bam_path, bed_path) = build_summary_fixture_bam();
     let summary_path = scratch_path("summary_merged.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: None,
@@ -542,6 +772,8 @@ fn profile_summary_merges_anchors_within_custom_distance() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 3000,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -623,7 +855,7 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
     let summary_path = scratch_path("summary_multi_motif.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: None,
@@ -636,6 +868,8 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -718,7 +952,7 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
     let summary_path = scratch_path("summary_iupac_motif.json");
 
     let args = ProfileArgs {
-        bed: bed_path,
+        sink_bed: bed_path,
         input: bam_path.to_str().unwrap().to_string(),
         summary: summary_path.clone(),
         output: None,
@@ -731,6 +965,8 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
         max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
+        full_sink_bed: None,
+        sink_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,

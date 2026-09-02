@@ -74,6 +74,22 @@ pub fn locate(regions: &[Region], tid: i32, pos: i64) -> Option<usize> {
     (region.tid == tid && region.start <= pos && pos < region.end).then_some(idx - 1)
 }
 
+/// Total bp of overlap between `[start, end)` on `tid` and `regions`.
+/// `regions` must be sorted and non-overlapping per contig (i.e. the output
+/// of [`merge_regions`] or [`merge_within`]).
+pub fn overlap_length(regions: &[Region], tid: i32, start: i64, end: i64) -> i64 {
+    let idx = regions.partition_point(|r| (r.tid, r.end) <= (tid, start));
+
+    let mut total = 0i64;
+    for region in &regions[idx..] {
+        if region.tid != tid || region.start >= end {
+            break;
+        }
+        total += region.end.min(end) - region.start.max(start);
+    }
+    total
+}
+
 /// Sort and merge overlapping/touching regions, per contig.
 pub fn merge_regions(regions: &[Region]) -> Vec<Region> {
     merge_within(regions, 0)
@@ -237,6 +253,36 @@ mod tests {
             merge_within(&regions, 1_000_000),
             vec![r(0, 10, 20), r(1, 25, 35)]
         );
+    }
+
+    #[test]
+    fn overlap_length_no_regions() {
+        assert_eq!(overlap_length(&[], 0, 10, 20), 0);
+    }
+
+    #[test]
+    fn overlap_length_partial_and_full_overlap() {
+        let regions = merge_regions(&[r(0, 10, 20), r(0, 30, 50)]);
+        // Partial overlap with the first region, none with the second.
+        assert_eq!(overlap_length(&regions, 0, 15, 25), 5);
+        // Fully contains the second region.
+        assert_eq!(overlap_length(&regions, 0, 25, 60), 20);
+        // Spans both regions plus the gap between them.
+        assert_eq!(overlap_length(&regions, 0, 0, 60), 30);
+    }
+
+    #[test]
+    fn overlap_length_no_overlap() {
+        let regions = merge_regions(&[r(0, 10, 20)]);
+        assert_eq!(overlap_length(&regions, 0, 20, 30), 0);
+        assert_eq!(overlap_length(&regions, 0, 0, 10), 0);
+    }
+
+    #[test]
+    fn overlap_length_ignores_other_contigs() {
+        let regions = merge_regions(&[r(0, 10, 20), r(1, 10, 20)]);
+        assert_eq!(overlap_length(&regions, 2, 10, 20), 0);
+        assert_eq!(overlap_length(&regions, 1, 10, 20), 10);
     }
 
     #[test]

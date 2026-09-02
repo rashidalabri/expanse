@@ -13,9 +13,11 @@ use crate::irr;
 
 #[derive(Args, Debug)]
 pub struct ProfileArgs {
-    /// BED file of IRR-mapping regions to scan for candidate low-mapq reads.
+    /// BED file of IRR-mapping regions to scan for candidate low-mapq
+    /// reads. Also used as the default sink regions for the `--summary`
+    /// removal step; see `--full-sink-bed`.
     #[arg(long)]
-    pub bed: PathBuf,
+    pub sink_bed: PathBuf,
 
     /// Input CRAM/BAM: local path or s3:// / gs:// / https:// URL.
     #[arg(short = 'i', long)]
@@ -23,7 +25,8 @@ pub struct ProfileArgs {
 
     /// JSON summary output path: for each merged anchor region, its
     /// coordinates (0-based, half-open) and a breakdown of IRR counts by
-    /// motif. Always written.
+    /// motif. Always written. Anchor regions excluded by the sink-region
+    /// check (`--full-sink-bed` / `--sink-overlap-fraction`) are omitted.
     #[arg(long)]
     pub summary: PathBuf,
 
@@ -73,6 +76,22 @@ pub struct ProfileArgs {
     /// recorded location (BAM RNEXT/PNEXT) is used.
     #[arg(long, default_value_t = 150)]
     pub read_length: i64,
+
+    /// Optional BED file of "sink" regions (e.g. known problematic loci) to
+    /// check merged anchor regions against for `--summary`: any merged
+    /// anchor region that overlaps sink regions by more than
+    /// `--sink-overlap-fraction` of its own length is dropped from the
+    /// output. Used only for this removal step -- IRR scanning always uses
+    /// `--sink-bed`. When omitted, `--sink-bed` itself is used as the sink
+    /// regions.
+    #[arg(long)]
+    pub full_sink_bed: Option<PathBuf>,
+
+    /// Fraction of a merged anchor region's length that must overlap the
+    /// sink regions (`--full-sink-bed`, or `--sink-bed` if that's not
+    /// given) for that anchor region to be excluded from `--summary`.
+    #[arg(long, default_value_t = 0.8)]
+    pub sink_overlap_fraction: f64,
 
     /// Reference FASTA. Required when the input or output uses CRAM.
     #[arg(short = 'r', long)]
@@ -147,13 +166,24 @@ pub fn run(args: ProfileArgs) -> Result<()> {
 
     let header = Header::from_template(reader.header());
 
-    let bed_regions = bed::parse_bed(&args.bed, reader.header())
-        .with_context(|| format!("failed to parse BED file {:?}", args.bed))?;
+    let bed_regions = bed::parse_bed(&args.sink_bed, reader.header())
+        .with_context(|| format!("failed to parse BED file {:?}", args.sink_bed))?;
     if bed_regions.is_empty() {
-        log::warn!("BED file {:?} contained no usable regions", args.bed);
+        log::warn!("BED file {:?} contained no usable regions", args.sink_bed);
     }
 
     let bed_fetch_regions = bed::merge_regions(&bed_regions);
+
+    // Sink regions used only for the --summary removal step below; IRR
+    // scanning above always fetches from `bed_fetch_regions` regardless.
+    let sink_regions = match &args.full_sink_bed {
+        Some(full_sink_bed) => {
+            let regions = bed::parse_bed(full_sink_bed, reader.header())
+                .with_context(|| format!("failed to parse sink BED file {full_sink_bed:?}"))?;
+            bed::merge_regions(&regions)
+        }
+        None => bed_fetch_regions.clone(),
+    };
 
     let mut writer = match (&args.output, resolved_output_format) {
         (Some(output_path), Some(format)) => {
@@ -287,9 +317,22 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         }
     }
 
+    let mut sink_excluded_count: u64 = 0;
     let summaries: Vec<AnchorRegionSummary> = anchor_clusters
         .iter()
         .enumerate()
+        .filter(|(_, region)| {
+            if sink_regions.is_empty() {
+                return true;
+            }
+            let overlap = bed::overlap_length(&sink_regions, region.tid, region.start, region.end);
+            let fraction = overlap as f64 / (region.end - region.start) as f64;
+            let keep = fraction <= args.sink_overlap_fraction;
+            if !keep {
+                sink_excluded_count += 1;
+            }
+            keep
+        })
         .map(|(idx, region)| {
             let motifs: BTreeMap<String, usize> = cluster_motif_counts[idx]
                 .iter()
@@ -314,11 +357,13 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     log::info!(
         "profile: {} region fetches ({} BED regions), {pass_count} candidate IRR reads \
          ({} distinct, {anchored_count} anchored, {unanchored_count} dropped for lacking a \
-         mapped mate), {} anchor regions summarized to {:?}{}",
+         mapped mate), {} anchor regions ({sink_excluded_count} dropped for >{}% overlap with \
+         sink regions) summarized to {:?}{}",
         bed_fetch_regions.len(),
         bed_regions.len(),
         anchored_count as u64 + unanchored_count,
         anchor_clusters.len(),
+        args.sink_overlap_fraction * 100.0,
         args.summary,
         if args.output.is_some() {
             format!(", {written_count} IRR reads written to {:?}", args.output)
