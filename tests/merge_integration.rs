@@ -29,6 +29,16 @@ fn write_manifest(name: &str, entries: &[(&str, &PathBuf)]) -> PathBuf {
     path
 }
 
+fn write_depths(name: &str, entries: &[(&str, f64)]) -> PathBuf {
+    let path = scratch_path(name);
+    let contents: String = entries
+        .iter()
+        .map(|(sample_id, depth)| format!("{sample_id}\t{depth}\n"))
+        .collect();
+    fs::write(&path, contents).unwrap();
+    path
+}
+
 fn read_merged(path: &PathBuf) -> Vec<serde_json::Value> {
     let text = fs::read_to_string(path).expect("merged summary should be written");
     let mut value: Vec<serde_json::Value> =
@@ -57,6 +67,8 @@ fn merge_combines_nearby_loci_across_samples() {
         output: output.clone(),
         merge_distance: 500,
         batch_size: 100,
+        depths: None,
+        target_depth: 30.0,
     })
     .expect("merge run should succeed");
 
@@ -66,11 +78,11 @@ fn merge_combines_nearby_loci_across_samples() {
     assert_eq!(locus["chrom"], "chr1");
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 1200);
-    assert_eq!(locus["irr_count"]["sampleA"], 5);
-    assert_eq!(locus["irr_count"]["sampleB"], 3);
-    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 5);
-    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 2);
-    assert_eq!(locus["motifs"]["GATA"]["sampleB"], 1);
+    assert_eq!(locus["irr_count"]["sampleA"], 5.0);
+    assert_eq!(locus["irr_count"]["sampleB"], 3.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 5.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 2.0);
+    assert_eq!(locus["motifs"]["GATA"]["sampleB"], 1.0);
 }
 
 /// Loci far enough apart should stay as separate merged loci.
@@ -92,6 +104,8 @@ fn merge_keeps_distant_loci_separate() {
         output: output.clone(),
         merge_distance: 500,
         batch_size: 100,
+        depths: None,
+        target_depth: 30.0,
     })
     .expect("merge run should succeed");
 
@@ -134,6 +148,8 @@ fn merge_chains_transitively_across_batch_boundaries() {
         output: output.clone(),
         merge_distance: 500,
         batch_size: 1,
+        depths: None,
+        target_depth: 30.0,
     })
     .expect("merge run should succeed");
 
@@ -146,12 +162,12 @@ fn merge_chains_transitively_across_batch_boundaries() {
     let locus = &merged[0];
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 2300);
-    assert_eq!(locus["irr_count"]["sampleA"], 1);
-    assert_eq!(locus["irr_count"]["sampleB"], 2);
-    assert_eq!(locus["irr_count"]["sampleC"], 4);
-    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 1);
-    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 2);
-    assert_eq!(locus["motifs"]["CAG"]["sampleC"], 4);
+    assert_eq!(locus["irr_count"]["sampleA"], 1.0);
+    assert_eq!(locus["irr_count"]["sampleB"], 2.0);
+    assert_eq!(locus["irr_count"]["sampleC"], 4.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 1.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 2.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleC"], 4.0);
 }
 
 /// The same three-sample fixture as the chaining test above, but run with
@@ -182,6 +198,8 @@ fn merge_result_is_independent_of_batch_size() {
         output: output.clone(),
         merge_distance: 500,
         batch_size: 100,
+        depths: None,
+        target_depth: 30.0,
     })
     .expect("merge run should succeed");
 
@@ -190,9 +208,9 @@ fn merge_result_is_independent_of_batch_size() {
     let locus = &merged[0];
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 2300);
-    assert_eq!(locus["irr_count"]["sampleA"], 1);
-    assert_eq!(locus["irr_count"]["sampleB"], 2);
-    assert_eq!(locus["irr_count"]["sampleC"], 4);
+    assert_eq!(locus["irr_count"]["sampleA"], 1.0);
+    assert_eq!(locus["irr_count"]["sampleB"], 2.0);
+    assert_eq!(locus["irr_count"]["sampleC"], 4.0);
 }
 
 /// Distinct contigs must never be bridged together, no matter how the
@@ -218,6 +236,8 @@ fn merge_does_not_bridge_across_contigs() {
         output: output.clone(),
         merge_distance: 500,
         batch_size: 100,
+        depths: None,
+        target_depth: 30.0,
     })
     .expect("merge run should succeed");
 
@@ -255,6 +275,8 @@ fn merge_sums_same_sample_contributions_bridged_across_batches() {
         output: output.clone(),
         merge_distance: 500,
         batch_size: 1,
+        depths: None,
+        target_depth: 30.0,
     })
     .expect("merge run should succeed");
 
@@ -268,10 +290,133 @@ fn merge_sums_same_sample_contributions_bridged_across_batches() {
     assert_eq!(locus["start"], 1000);
     assert_eq!(locus["end"], 2300);
     assert_eq!(
-        locus["irr_count"]["sampleA"], 5,
+        locus["irr_count"]["sampleA"], 5.0,
         "sampleA's two separate contributions (1 + 4) should be summed: {merged:#?}"
     );
-    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 5);
-    assert_eq!(locus["irr_count"]["sampleB"], 2);
-    assert_eq!(locus["motifs"]["GATA"]["sampleB"], 2);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 5.0);
+    assert_eq!(locus["irr_count"]["sampleB"], 2.0);
+    assert_eq!(locus["motifs"]["GATA"]["sampleB"], 2.0);
+}
+
+/// With `--depths` given, every sample's `irr_count`/`motifs` counts should
+/// be normalized to `--target-depth` via `(count * target_depth) /
+/// sample_depth`, independently per sample.
+#[test]
+fn merge_normalizes_counts_to_target_depth_when_depths_given() {
+    let sample_a = write_summary(
+        "depth_a.json",
+        r#"[{"chrom":"chr1","start":1000,"end":1100,"irr_count":10,"motifs":{"CAG":10}}]"#,
+    );
+    let sample_b = write_summary(
+        "depth_b.json",
+        r#"[{"chrom":"chr1","start":1090,"end":1200,"irr_count":6,"motifs":{"CAG":6}}]"#,
+    );
+    let manifest = write_manifest(
+        "manifest_depth.tsv",
+        &[("sampleA", &sample_a), ("sampleB", &sample_b)],
+    );
+    // sampleA: depth 20 -> (10 * 30) / 20 = 15
+    // sampleB: depth 10 -> (6 * 30) / 10 = 18
+    let depths = write_depths("depths.tsv", &[("sampleA", 20.0), ("sampleB", 10.0)]);
+    let output = scratch_path("merged_depth.json");
+
+    run(MergeArgs {
+        manifest,
+        output: output.clone(),
+        merge_distance: 500,
+        batch_size: 100,
+        depths: Some(depths),
+        target_depth: 30.0,
+    })
+    .expect("merge run should succeed");
+
+    let merged = read_merged(&output);
+    assert_eq!(merged.len(), 1, "expected one merged locus: {merged:#?}");
+    let locus = &merged[0];
+    assert_eq!(locus["irr_count"]["sampleA"], 15.0);
+    assert_eq!(locus["irr_count"]["sampleB"], 18.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleA"], 15.0);
+    assert_eq!(locus["motifs"]["CAG"]["sampleB"], 18.0);
+}
+
+/// A custom `--target-depth` should scale the normalized counts
+/// proportionally.
+#[test]
+fn merge_normalizes_counts_to_custom_target_depth() {
+    let sample_a = write_summary(
+        "custom_depth_a.json",
+        r#"[{"chrom":"chr1","start":1000,"end":1100,"irr_count":10,"motifs":{"CAG":10}}]"#,
+    );
+    let manifest = write_manifest("manifest_custom_depth.tsv", &[("sampleA", &sample_a)]);
+    // depth 5 -> (10 * 50) / 5 = 100
+    let depths = write_depths("custom_depths.tsv", &[("sampleA", 5.0)]);
+    let output = scratch_path("merged_custom_depth.json");
+
+    run(MergeArgs {
+        manifest,
+        output: output.clone(),
+        merge_distance: 500,
+        batch_size: 100,
+        depths: Some(depths),
+        target_depth: 50.0,
+    })
+    .expect("merge run should succeed");
+
+    let merged = read_merged(&output);
+    assert_eq!(merged.len(), 1, "expected one merged locus: {merged:#?}");
+    assert_eq!(merged[0]["irr_count"]["sampleA"], 100.0);
+}
+
+/// A sample present in the manifest but missing from the `--depths` file
+/// should fail loudly instead of silently leaving it unnormalized.
+#[test]
+fn merge_errors_when_sample_missing_from_depths_file() {
+    let sample_a = write_summary(
+        "missing_depth_a.json",
+        r#"[{"chrom":"chr1","start":1000,"end":1100,"irr_count":10,"motifs":{"CAG":10}}]"#,
+    );
+    let manifest = write_manifest("manifest_missing_depth.tsv", &[("sampleA", &sample_a)]);
+    // Depths file doesn't mention sampleA at all.
+    let depths = write_depths("missing_depths.tsv", &[("someOtherSample", 20.0)]);
+    let output = scratch_path("merged_missing_depth.json");
+
+    let result = run(MergeArgs {
+        manifest,
+        output,
+        merge_distance: 500,
+        batch_size: 100,
+        depths: Some(depths),
+        target_depth: 30.0,
+    });
+
+    let err = result.expect_err("merge should fail when a sample has no depth entry");
+    assert!(
+        err.to_string().contains("sampleA"),
+        "error should name the missing sample: {err}"
+    );
+}
+
+/// Without `--depths`, counts should be written raw (just cast to `f64`),
+/// matching the input's unnormalized values.
+#[test]
+fn merge_leaves_counts_raw_without_depths() {
+    let sample_a = write_summary(
+        "no_depth_a.json",
+        r#"[{"chrom":"chr1","start":1000,"end":1100,"irr_count":7,"motifs":{"CAG":7}}]"#,
+    );
+    let manifest = write_manifest("manifest_no_depth.tsv", &[("sampleA", &sample_a)]);
+    let output = scratch_path("merged_no_depth.json");
+
+    run(MergeArgs {
+        manifest,
+        output: output.clone(),
+        merge_distance: 500,
+        batch_size: 100,
+        depths: None,
+        target_depth: 30.0,
+    })
+    .expect("merge run should succeed");
+
+    let merged = read_merged(&output);
+    assert_eq!(merged[0]["irr_count"]["sampleA"], 7.0);
 }

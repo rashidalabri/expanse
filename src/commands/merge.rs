@@ -8,6 +8,10 @@
 //! Manifest samples are folded in `--batch-size` at a time rather than all
 //! at once, so peak memory is bounded by one batch's parsed summaries plus
 //! the running merged-locus set, not by the full manifest.
+//!
+//! If `--depths` is given, every count is normalized to `--target-depth`
+//! via `(count * target_depth) / sample_depth` before being written out;
+//! otherwise counts are written raw and a warning is logged.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -40,6 +44,20 @@ pub struct MergeArgs {
     /// memory usage stays bounded regardless of manifest size.
     #[arg(long, default_value_t = 100)]
     pub batch_size: usize,
+
+    /// Optional headerless TSV of per-sample sequencing depths:
+    /// `sample_id<TAB>depth` (float). When given, every sample's IRR
+    /// counts are normalized to `--target-depth` before being written out.
+    /// When omitted, counts are written raw (unnormalized) and a warning
+    /// is logged.
+    #[arg(long)]
+    pub depths: Option<PathBuf>,
+
+    /// Depth that IRR counts are normalized to when `--depths` is given:
+    /// `(count * target_depth) / sample_depth`. Has no effect without
+    /// `--depths`.
+    #[arg(long, default_value_t = 30.0)]
+    pub target_depth: f64,
 }
 
 /// One entry of a `profile --summary` input file. Mirrors
@@ -75,34 +93,62 @@ struct MergedLocus {
 /// One entry in the merge output. `irr_count` and `motifs` are pivoted from
 /// [`MergedLocus`]'s per-sample map onto per-sample maps of their own:
 /// `irr_count` is `{sample_id: count}`, and `motifs` is
-/// `{motif: {sample_id: count}}`.
+/// `{motif: {sample_id: count}}`. Counts are depth-normalized (see
+/// [`normalize_count`]) when a depths file was given.
 #[derive(Serialize, Debug)]
 struct MergedLocusOutput {
     chrom: String,
     start: i64,
     end: i64,
-    irr_count: BTreeMap<String, usize>,
-    motifs: BTreeMap<String, BTreeMap<String, usize>>,
+    irr_count: BTreeMap<String, f64>,
+    motifs: BTreeMap<String, BTreeMap<String, f64>>,
 }
 
-impl From<MergedLocus> for MergedLocusOutput {
-    fn from(locus: MergedLocus) -> Self {
-        let mut irr_count = BTreeMap::new();
-        let mut motifs: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-        for (sample_id, summary) in locus.samples {
-            irr_count.insert(sample_id.clone(), summary.irr_count);
-            for (motif, count) in summary.motifs {
-                motifs.entry(motif).or_default().insert(sample_id.clone(), count);
-            }
+/// Normalizes a raw IRR count for `sample_id` to `target_depth`, i.e.
+/// `(count * target_depth) / sample_depth`. Passing `depths: None` (no
+/// `--depths` file given) leaves the count unnormalized, just cast to
+/// `f64`.
+fn normalize_count(
+    count: usize,
+    sample_id: &str,
+    depths: Option<&HashMap<String, f64>>,
+    target_depth: f64,
+) -> Result<f64> {
+    match depths {
+        Some(depths) => {
+            let depth = depths
+                .get(sample_id)
+                .with_context(|| format!("sample {sample_id:?} has no entry in the depths file"))?;
+            Ok(count as f64 * target_depth / depth)
         }
-        MergedLocusOutput {
-            chrom: locus.chrom,
-            start: locus.start,
-            end: locus.end,
-            irr_count,
-            motifs,
+        None => Ok(count as f64),
+    }
+}
+
+fn locus_to_output(
+    locus: MergedLocus,
+    depths: Option<&HashMap<String, f64>>,
+    target_depth: f64,
+) -> Result<MergedLocusOutput> {
+    let mut irr_count = BTreeMap::new();
+    let mut motifs: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    for (sample_id, summary) in locus.samples {
+        irr_count.insert(
+            sample_id.clone(),
+            normalize_count(summary.irr_count, &sample_id, depths, target_depth)?,
+        );
+        for (motif, count) in summary.motifs {
+            let normalized = normalize_count(count, &sample_id, depths, target_depth)?;
+            motifs.entry(motif).or_default().insert(sample_id.clone(), normalized);
         }
     }
+    Ok(MergedLocusOutput {
+        chrom: locus.chrom,
+        start: locus.start,
+        end: locus.end,
+        irr_count,
+        motifs,
+    })
 }
 
 /// A region plus everything it contributes to whichever merged locus it
@@ -140,6 +186,35 @@ fn parse_manifest(path: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(entries)
 }
 
+fn parse_depths(path: &Path) -> Result<HashMap<String, f64>> {
+    let file = File::open(path).with_context(|| format!("failed to open depths file {path:?}"))?;
+    let reader = BufReader::new(file);
+
+    let mut depths = HashMap::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("failed to read {path:?} at line {}", line_no + 1))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut fields = line.splitn(2, '\t');
+        let sample_id = fields
+            .next()
+            .with_context(|| format!("{path:?}:{}: missing sample_id column", line_no + 1))?;
+        let depth: f64 = fields
+            .next()
+            .with_context(|| format!("{path:?}:{}: missing depth column", line_no + 1))?
+            .trim()
+            .parse()
+            .with_context(|| format!("{path:?}:{}: invalid depth value", line_no + 1))?;
+
+        depths.insert(sample_id.to_string(), depth);
+    }
+
+    Ok(depths)
+}
+
 pub fn run(args: MergeArgs) -> Result<()> {
     if args.batch_size == 0 {
         bail!("--batch-size must be greater than zero");
@@ -149,6 +224,17 @@ pub fn run(args: MergeArgs) -> Result<()> {
     if manifest_entries.is_empty() {
         log::warn!("manifest {:?} contained no samples", args.manifest);
     }
+
+    let depths = match &args.depths {
+        Some(path) => Some(parse_depths(path)?),
+        None => {
+            log::warn!(
+                "no --depths file given: IRR counts will be written raw, not normalized to a \
+                 target depth"
+            );
+            None
+        }
+    };
 
     // Contig name -> synthetic tid, assigned in order of first appearance
     // and kept stable across batches so merged loci from earlier batches
@@ -266,7 +352,10 @@ pub fn run(args: MergeArgs) -> Result<()> {
     }
 
     let merged_count = merged.len();
-    let output: Vec<MergedLocusOutput> = merged.into_iter().map(MergedLocusOutput::from).collect();
+    let output: Vec<MergedLocusOutput> = merged
+        .into_iter()
+        .map(|locus| locus_to_output(locus, depths.as_ref(), args.target_depth))
+        .collect::<Result<_>>()?;
 
     let json =
         serde_json::to_string_pretty(&output).context("failed to serialize merged locus summary")?;
