@@ -242,7 +242,7 @@ fn profile_extracts_irr_candidates() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -326,7 +326,7 @@ fn profile_writes_no_bam_output_by_default() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -363,7 +363,7 @@ fn profile_extracts_irr_candidates_cram() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: Some(reference_path),
         output_format: Some(OutputFormat::Bam),
         threads: 1,
@@ -481,7 +481,7 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -564,7 +564,7 @@ fn profile_summary_drops_anchor_regions_mostly_overlapping_sink_regions() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: Some(exclude_bed_path),
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -589,7 +589,7 @@ fn profile_summary_drops_anchor_regions_mostly_overlapping_sink_regions() {
 }
 
 #[test]
-fn profile_summary_keeps_anchor_regions_below_sink_overlap_fraction() {
+fn profile_summary_keeps_anchor_regions_below_exclude_overlap_fraction() {
     let (bam_path, bed_path) = build_summary_fixture_bam();
     let summary_path = scratch_path("summary_sink_partial.json");
     // Overlaps only 50bp of the 150bp-wide "far" anchor region
@@ -612,7 +612,7 @@ fn profile_summary_keeps_anchor_regions_below_sink_overlap_fraction() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: Some(exclude_bed_path),
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -687,7 +687,7 @@ fn profile_summary_defaults_sink_regions_to_bed_when_exclude_bed_omitted() {
         // No --exclude-bed: sink regions should default to --sink-bed itself
         // (chr1:50-150), which fully contains this anchor ([70, 120)).
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -731,7 +731,7 @@ fn profile_summary_exclude_bed_overrides_default_bed_fallback() {
         anchor_merge_distance: 500,
         read_length: 50,
         exclude_bed: Some(exclude_bed_path),
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -773,7 +773,7 @@ fn profile_summary_merges_anchors_within_custom_distance() {
         anchor_merge_distance: 3000,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -869,7 +869,7 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,
@@ -966,7 +966,7 @@ fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
-        sink_overlap_fraction: 0.8,
+        exclude_overlap_fraction: 0.8,
         reference: None,
         output_format: None,
         threads: 1,

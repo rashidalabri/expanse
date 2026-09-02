@@ -26,7 +26,7 @@ pub struct ProfileArgs {
     /// JSON summary output path: for each merged anchor region, its
     /// coordinates (0-based, half-open) and a breakdown of IRR counts by
     /// motif. Always written. Anchor regions excluded by the sink-region
-    /// check (`--exclude-bed` / `--sink-overlap-fraction`) are omitted.
+    /// check (`--exclude-bed` / `--exclude-overlap-fraction`) are omitted.
     #[arg(long)]
     pub summary: PathBuf,
 
@@ -80,7 +80,7 @@ pub struct ProfileArgs {
     /// Optional BED file of "sink" regions (e.g. known problematic loci) to
     /// check merged anchor regions against for `--summary`: any merged
     /// anchor region that overlaps sink regions by more than
-    /// `--sink-overlap-fraction` of its own length is dropped from the
+    /// `--exclude-overlap-fraction` of its own length is dropped from the
     /// output. Used only for this removal step -- IRR scanning always uses
     /// `--sink-bed`. When omitted, `--sink-bed` itself is used as the sink
     /// regions.
@@ -91,7 +91,7 @@ pub struct ProfileArgs {
     /// sink regions (`--exclude-bed`, or `--sink-bed` if that's not
     /// given) for that anchor region to be excluded from `--summary`.
     #[arg(long, default_value_t = 0.8)]
-    pub sink_overlap_fraction: f64,
+    pub exclude_overlap_fraction: f64,
 
     /// Reference FASTA. Required when the input or output uses CRAM.
     #[arg(short = 'r', long)]
@@ -327,7 +327,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             }
             let overlap = bed::overlap_length(&sink_regions, region.tid, region.start, region.end);
             let fraction = overlap as f64 / (region.end - region.start) as f64;
-            let keep = fraction <= args.sink_overlap_fraction;
+            let keep = fraction <= args.exclude_overlap_fraction;
             if !keep {
                 sink_excluded_count += 1;
             }
@@ -363,7 +363,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         bed_regions.len(),
         anchored_count as u64 + unanchored_count,
         anchor_clusters.len(),
-        args.sink_overlap_fraction * 100.0,
+        args.exclude_overlap_fraction * 100.0,
         args.summary,
         if args.output.is_some() {
             format!(", {written_count} IRR reads written to {:?}", args.output)
