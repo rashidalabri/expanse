@@ -34,7 +34,8 @@ fn non_repetitive_seq() -> Vec<u8> {
 /// `seq`, used so tests assert against the real canonicalization instead of
 /// a hardcoded (and possibly wrong) guess at its output. `seq` is expected
 /// to be a clean, single-motif fixture, so exactly one motif should come
-/// back.
+/// back. Uses zero degenerate limits, matching what `sinks` itself always
+/// uses.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
     let motifs = expanse::irr::identify_repeat_motifs(
@@ -42,7 +43,12 @@ fn canonical_motif(seq: &[u8]) -> String {
         &quals,
         2,
         20,
-        expanse::irr::DegenerateLimits::default(),
+        expanse::irr::DegenerateLimits {
+            mononucleotide: 0,
+            dinucleotide: 0,
+            trinucleotide: 0,
+            other: 0,
+        },
     );
     assert_eq!(
         motifs.len(),
@@ -194,10 +200,6 @@ fn default_args(input: String, output: PathBuf, reference: Option<PathBuf>) -> S
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         merge_distance: 0,
         reference,
         threads: 1,

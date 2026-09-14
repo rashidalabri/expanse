@@ -51,23 +51,6 @@ pub struct SinksArgs {
     #[arg(long, default_value_t = irr::DEFAULT_MOTIF_MAX_LEN)]
     pub motif_max_len: u32,
 
-    /// Maximum number of IUPAC-ambiguous (non-A/C/G/T) positions allowed in
-    /// a mononucleotide (1bp) motif; motifs exceeding this are rejected.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE)]
-    pub max_degenerate_mononucleotide: u32,
-
-    /// Same, for a dinucleotide (2bp) motif.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE)]
-    pub max_degenerate_dinucleotide: u32,
-
-    /// Same, for a trinucleotide (3bp) motif.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE)]
-    pub max_degenerate_trinucleotide: u32,
-
-    /// Same, for any motif of 4bp or longer.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_OTHER)]
-    pub max_degenerate_other: u32,
-
     /// Merge same-motif IRR-read regions within this many bp of each other
     /// into one output region.
     #[arg(long, default_value_t = 0)]
@@ -104,11 +87,13 @@ pub fn run(args: SinksArgs) -> Result<()> {
             .context("failed to set reader thread count")?;
     }
 
+    // Unlike `profile`, `sinks` never allows IUPAC-ambiguous positions in a
+    // motif -- only plain A/C/G/T repeat units count as IRR evidence here.
     let degenerate_limits = irr::DegenerateLimits {
-        mononucleotide: args.max_degenerate_mononucleotide,
-        dinucleotide: args.max_degenerate_dinucleotide,
-        trinucleotide: args.max_degenerate_trinucleotide,
-        other: args.max_degenerate_other,
+        mononucleotide: 0,
+        dinucleotide: 0,
+        trinucleotide: 0,
+        other: 0,
     };
 
     // Each IRR read's alignment span is filed under every motif it
