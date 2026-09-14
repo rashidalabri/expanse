@@ -161,6 +161,20 @@ pub fn identify_repeat_motifs(
 ) -> Vec<Vec<u8>> {
     let smallest_period = motif_min_len.max(1) as usize;
     let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
+    let bases_len = bases.len() as f64;
+    // An internal short-circuit threshold only -- every per-motif accept/
+    // reject decision below still uses the exact original `score /
+    // bases_len >= MIN_IRR_SCORE` comparison, so this never changes which
+    // motifs come back (including the bases_len == 0 edge case, where this
+    // threshold is 0.0 but the real comparison's `0.0 / 0.0` is NaN and
+    // therefore never passes).
+    let early_exit_score = MIN_IRR_SCORE * bases_len;
+
+    // The read's reverse complement doesn't depend on the candidate period,
+    // so it's the same for every iteration below; computed at most once,
+    // lazily, since a period whose forward orientation alone already clears
+    // the score threshold never needs it at all.
+    let mut bases_rc_cache: Option<(Vec<u8>, Vec<u8>)> = None;
 
     let mut motifs: Vec<Vec<u8>> = Vec::new();
     for period in smallest_period..=largest_period {
@@ -194,8 +208,35 @@ pub fn identify_repeat_motifs(
         }
 
         let unit_shifts = shift_unit(&canonical);
-        let score = match_repeat_rc(&unit_shifts, bases, quals) / bases.len() as f64;
-        if score >= MIN_IRR_SCORE {
+        let forward_score = best_score_across_shifts(
+            &unit_shifts,
+            bases,
+            quals,
+            MIN_BASE_QUALITY,
+            early_exit_score,
+        );
+        // The forward score alone already clears the threshold, so the
+        // (comparatively expensive) reverse-complement orientation can't
+        // change the accept/reject outcome -- skip computing it.
+        let score = if forward_score >= early_exit_score {
+            forward_score
+        } else {
+            let (bases_rc, quals_rc) = bases_rc_cache.get_or_insert_with(|| {
+                let bases_rc = reverse_complement(bases);
+                let mut quals_rc = quals.to_vec();
+                quals_rc.reverse();
+                (bases_rc, quals_rc)
+            });
+            let reverse_score = best_score_across_shifts(
+                &unit_shifts,
+                bases_rc,
+                quals_rc,
+                MIN_BASE_QUALITY,
+                early_exit_score,
+            );
+            forward_score.max(reverse_score)
+        };
+        if score / bases_len >= MIN_IRR_SCORE {
             motifs.push(canonical);
         }
     }
@@ -251,22 +292,42 @@ fn smallest_frequent_period(
     best_period
 }
 
+/// Number of distinct letters [`ALPHABET_INDEX`] covers (`A`..=`Z`). Every
+/// byte [`extract_consensus_base`]/[`extract_consensus_base_iupac`] ever
+/// tally -- raw read bases (always `A`/`C`/`G`/`T`/`N`) and, during period
+/// reduction, a previously-computed consensus unit's bytes (which may be
+/// any of the 15 IUPAC letters) -- is an uppercase ASCII letter, so a
+/// 26-entry array covers every real input while costing far less to zero
+/// and scan per call than a full 256-entry one.
+const ALPHABET_SIZE: usize = 26;
+
+/// Vote-tally array index for an uppercase ASCII letter (see
+/// [`ALPHABET_SIZE`]).
+fn alphabet_index(base: u8) -> usize {
+    debug_assert!(
+        base.is_ascii_uppercase(),
+        "expected an uppercase base/IUPAC-code byte, got {base}"
+    );
+    (base - b'A') as usize
+}
+
 fn extract_consensus_base(offset: usize, period: usize, bases: &[u8]) -> u8 {
-    let mut counts = [0u32; 256];
+    let mut counts = [0u32; ALPHABET_SIZE];
     let mut index = offset;
     while index < bases.len() {
-        counts[bases[index] as usize] += 1;
+        counts[alphabet_index(bases[index])] += 1;
         index += period;
     }
 
     // Ties (equal counts) are broken deterministically by preferring the
-    // larger byte value.
+    // larger byte value (equivalently, the larger alphabet index, since
+    // the two are in the same order).
     counts
         .iter()
         .enumerate()
         .filter(|&(_, &count)| count > 0)
-        .max_by_key(|&(base, &count)| (count, base))
-        .map(|(base, _)| base as u8)
+        .max_by_key(|&(index, &count)| (count, index))
+        .map(|(index, _)| index as u8 + b'A')
         .unwrap_or(b'?')
 }
 
@@ -299,18 +360,18 @@ fn extract_consensus_repeat_unit(period: usize, bases: &[u8]) -> Vec<u8> {
 ///-blind, over every observed base).
 fn extract_consensus_base_iupac(offset: usize, period: usize, bases: &[u8], quals: &[u8]) -> u8 {
     if period >= 2 {
-        let mut hq_counts = [0u32; 256];
+        let mut hq_counts = [0u32; ALPHABET_SIZE];
         let mut index = offset;
         while index < bases.len() {
             if quals[index] >= MIN_BASE_QUALITY {
-                hq_counts[bases[index] as usize] += 1;
+                hq_counts[alphabet_index(bases[index])] += 1;
             }
             index += period;
         }
 
         let acgt_total: u32 = [b'A', b'C', b'G', b'T']
             .iter()
-            .map(|&b| hq_counts[b as usize])
+            .map(|&b| hq_counts[alphabet_index(b)])
             .sum();
         if acgt_total >= MIN_DEGENERACY_SAMPLES {
             for tier in IUPAC_TIERS {
@@ -319,7 +380,10 @@ fn extract_consensus_base_iupac(offset: usize, period: usize, bases: &[u8], qual
                     .map(|&(code, members)| {
                         (
                             code,
-                            members.iter().map(|&b| hq_counts[b as usize]).sum::<u32>(),
+                            members
+                                .iter()
+                                .map(|&b| hq_counts[alphabet_index(b)])
+                                .sum::<u32>(),
                         )
                     })
                     .max_by_key(|&(code, covered)| (covered, code))
@@ -446,29 +510,29 @@ fn score_repeat(unit: &[u8], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
 }
 
 /// The best [`score_repeat`] across every rotation in `unit_shifts` (see
-/// [`shift_unit`]), since the read's phase relative to the motif is unknown.
+/// [`shift_unit`]), since the read's phase relative to the motif is
+/// unknown. Stops scanning further rotations as soon as the running best
+/// clears `early_exit_at` -- callers only ever compare this result against
+/// that same threshold, and once it's cleared, no later rotation (which can
+/// only raise, never lower, the running max) could change that outcome.
 fn best_score_across_shifts(
     unit_shifts: &[Vec<u8>],
     bases: &[u8],
     quals: &[u8],
     min_baseq: u8,
+    early_exit_at: f64,
 ) -> f64 {
-    unit_shifts
-        .iter()
-        .map(|shift| score_repeat(shift, bases, quals, min_baseq))
-        .fold(f64::NEG_INFINITY, f64::max)
-}
-
-fn match_repeat_rc(unit_shifts: &[Vec<u8>], bases: &[u8], quals: &[u8]) -> f64 {
-    let forward_score = best_score_across_shifts(unit_shifts, bases, quals, MIN_BASE_QUALITY);
-
-    let bases_rc = reverse_complement(bases);
-    let mut quals_rc = quals.to_vec();
-    quals_rc.reverse();
-    let reverse_score =
-        best_score_across_shifts(unit_shifts, &bases_rc, &quals_rc, MIN_BASE_QUALITY);
-
-    forward_score.max(reverse_score)
+    let mut best = f64::NEG_INFINITY;
+    for shift in unit_shifts {
+        let score = score_repeat(shift, bases, quals, min_baseq);
+        if score > best {
+            best = score;
+        }
+        if best >= early_exit_at {
+            break;
+        }
+    }
+    best
 }
 
 #[cfg(test)]
