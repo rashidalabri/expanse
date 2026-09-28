@@ -37,13 +37,7 @@ fn non_repetitive_seq() -> Vec<u8> {
 /// should come back.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
-    let motifs = expanse::irr::identify_repeat_motifs(
-        seq,
-        &quals,
-        2,
-        20,
-        expanse::irr::DegenerateLimits::default(),
-    );
+    let motifs = expanse::irr::identify_repeat_motifs(seq, &quals, 2, 20);
     assert_eq!(
         motifs.len(),
         1,
@@ -235,10 +229,6 @@ fn profile_extracts_irr_candidates() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
@@ -319,10 +309,6 @@ fn profile_writes_no_bam_output_by_default() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
@@ -356,10 +342,6 @@ fn profile_extracts_irr_candidates_cram() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
@@ -474,10 +456,6 @@ fn profile_summary_keeps_distant_anchors_separate_by_default() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
@@ -557,10 +535,6 @@ fn profile_summary_drops_anchor_regions_mostly_overlapping_sink_regions() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: Some(exclude_bed_path),
@@ -605,10 +579,6 @@ fn profile_summary_keeps_anchor_regions_below_exclude_overlap_fraction() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: Some(exclude_bed_path),
@@ -678,10 +648,6 @@ fn profile_summary_drops_anchor_regions_overlapping_sink_bed() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 50,
         // No --exclude-bed: --sink-bed alone (chr1:50-150) is always used
@@ -726,10 +692,6 @@ fn profile_summary_exclude_bed_exclusion_is_additive_to_sink_bed() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 50,
         exclude_bed: Some(exclude_bed_path),
@@ -768,10 +730,6 @@ fn profile_summary_merges_anchors_within_custom_distance() {
         max_irr_mapq: 40,
         motif_min_len: 2,
         motif_max_len: 20,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 3000,
         read_length: 150,
         exclude_bed: None,
@@ -816,9 +774,9 @@ fn profile_summary_merges_anchors_within_custom_distance() {
 /// mostly-A with only rare G interruptions passes the homopolymer "A"
 /// motif's thresholds despite not being a pure homopolymer, while the exact
 /// 21bp repeat unit also passes on its own -- so
-/// `irr::classify_in_repeat_read_all` legitimately returns two distinct
-/// motifs for it (see the equivalent unit test in `src/irr.rs` for why a
-/// pure homopolymer doesn't trigger this).
+/// `irr::identify_repeat_motifs` legitimately returns two distinct motifs
+/// for it (see the equivalent unit test in `src/irr.rs` for why a pure
+/// homopolymer doesn't trigger this).
 fn mostly_a_with_rare_g_seq() -> Vec<u8> {
     let unit: Vec<u8> = (0..20).map(|_| b'A').chain(std::iter::once(b'G')).collect();
     unit.iter().cloned().cycle().take(21 * 16).collect()
@@ -864,10 +822,6 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
         max_irr_mapq: 40,
         motif_min_len: 1,
         motif_max_len: 30,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
         anchor_merge_distance: 500,
         read_length: 150,
         exclude_bed: None,
@@ -898,18 +852,18 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
          qualifies under multiple motifs: {summary:#}"
     );
 
-    // Not asserting an exact motif count: with degenerate (IUPAC) motif
-    // calling, this fixture's confident, real G interruptions can also
-    // independently satisfy other periods via a partially degenerate
-    // (R-containing) motif. That doesn't matter for what this test checks
-    // -- every motif entry a single read contributes to must show count 1,
-    // never more, no matter how many entries there are.
+    // Plain majority-vote consensus (no ambiguity calling) collapses every
+    // other candidate period in this fixture back to the same "A"
+    // homopolymer motif (deduped), so exactly the read's two originally-
+    // intended qualifying motifs -- the homopolymer and the exact 21bp
+    // repeat unit -- should come back, each with count 1.
     let motifs = region["motifs"]
         .as_object()
         .expect("motifs should be a JSON object");
-    assert!(
-        motifs.len() >= 2,
-        "expected at least the read's two originally-intended qualifying motifs: {summary:#}"
+    assert_eq!(
+        motifs.len(),
+        2,
+        "expected exactly the read's two qualifying motifs: {summary:#}"
     );
     for (motif, count) in motifs {
         assert_eq!(
@@ -917,81 +871,4 @@ fn profile_summary_counts_multi_motif_read_once_per_motif_not_per_read() {
             "motif {motif:?} should have exactly 1 IRR: {summary:#}"
         );
     }
-}
-
-/// A motif containing an IUPAC ambiguity code (e.g. an `R` for a
-/// consistently purine-mixed position) should flow untouched through the
-/// whole pipeline -- dedup, clustering, and JSON serialization -- and show
-/// up as a plain ASCII string key in the `--summary` output, with no
-/// `profile.rs` code needing to know anything about the wider alphabet.
-#[test]
-fn profile_summary_reports_iupac_ambiguity_code_in_motif() {
-    let bam_path = scratch_path("iupac_motif_fixture.bam");
-    let header = fixture_header();
-    let seq = mostly_a_with_rare_g_seq();
-
-    {
-        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
-        writer
-            .write(&make_record(
-                "iupacMotif",
-                0,
-                60,
-                10,
-                PAIRED | READ1,
-                0,
-                5000,
-                &seq,
-            ))
-            .unwrap();
-    }
-    index::build(&bam_path, None, Type::Bai, 1).unwrap();
-
-    let bed_path = scratch_path("iupac_motif_fixture.bed");
-    let mut bed_file = File::create(&bed_path).unwrap();
-    writeln!(bed_file, "chr1\t50\t{}", 60 + seq.len() as i64 + 50).unwrap();
-
-    let summary_path = scratch_path("summary_iupac_motif.json");
-
-    let args = ProfileArgs {
-        sink_bed: bed_path,
-        input: bam_path.to_str().unwrap().to_string(),
-        summary: summary_path.clone(),
-        output: None,
-        max_irr_mapq: 40,
-        motif_min_len: 1,
-        motif_max_len: 30,
-        max_degenerate_mononucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-        max_degenerate_dinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-        max_degenerate_trinucleotide: expanse::irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-        max_degenerate_other: expanse::irr::DEFAULT_MAX_DEGENERATE_OTHER,
-        anchor_merge_distance: 500,
-        read_length: 150,
-        exclude_bed: None,
-        exclude_overlap_fraction: 0.8,
-        reference: None,
-        output_format: None,
-        threads: 1,
-    };
-
-    run(args).expect("profile run should succeed");
-
-    let summary_text =
-        std::fs::read_to_string(&summary_path).expect("summary JSON should be written");
-    let summary: serde_json::Value =
-        serde_json::from_str(&summary_text).expect("summary should be valid JSON");
-    let regions = summary.as_array().expect("summary should be a JSON array");
-    let motifs = regions[0]["motifs"]
-        .as_object()
-        .expect("motifs should be a JSON object");
-
-    let is_ambiguous = |motif: &str| {
-        motif
-            .bytes()
-            .any(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
-    };
-    assert!(
-        motifs.keys().any(|motif| is_ambiguous(motif)),
-        "expected at least one motif with an IUPAC ambiguity code in the summary: {summary:#}"
-    );
 }

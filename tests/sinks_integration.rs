@@ -34,22 +34,10 @@ fn non_repetitive_seq() -> Vec<u8> {
 /// `seq`, used so tests assert against the real canonicalization instead of
 /// a hardcoded (and possibly wrong) guess at its output. `seq` is expected
 /// to be a clean, single-motif fixture, so exactly one motif should come
-/// back. Uses zero degenerate limits, matching what `sinks` itself always
-/// uses.
+/// back.
 fn canonical_motif(seq: &[u8]) -> String {
     let quals = vec![40u8; seq.len()];
-    let motifs = expanse::irr::identify_repeat_motifs(
-        seq,
-        &quals,
-        2,
-        20,
-        expanse::irr::DegenerateLimits {
-            mononucleotide: 0,
-            dinucleotide: 0,
-            trinucleotide: 0,
-            other: 0,
-        },
-    );
+    let motifs = expanse::irr::identify_repeat_motifs(seq, &quals, 2, 20);
     assert_eq!(
         motifs.len(),
         1,

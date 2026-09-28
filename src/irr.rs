@@ -2,162 +2,56 @@
 //! sequence is dominated by repetitions of some short motif, and if so,
 //! returns the motif's canonical repeat unit.
 //!
-//! A returned motif may contain IUPAC ambiguity codes (`R`, `Y`, `S`, `W`,
-//! `K`, `M`, `B`, `D`, `H`, `V`, `N`) at positions that are consistently
-//! mixed across repeat copies rather than a single fixed base -- e.g. `GCN`
-//! (an unconstrained 3rd position) or `AARRG` (two purine-only positions).
-//! See [`extract_consensus_base_iupac`] for how a position is called
-//! degenerate, and [`degenerate_count`] for the per-motif cap callers place
-//! on how many positions may be degenerate before a motif is rejected
-//! outright -- separately configurable for mononucleotide, dinucleotide,
-//! trinucleotide, and longer motifs (see `max_degenerate_mononucleotide`
-//! /`max_degenerate_dinucleotide`/`max_degenerate_trinucleotide`
-//! /`max_degenerate_other` on [`classify_in_repeat_read_all`]).
+//! For a candidate period, the repeat unit is the plain per-phase
+//! majority-vote base (see [`extract_consensus_base`]), optionally reduced
+//! to a smaller period if the extracted unit is itself an exact
+//! smaller-period repeat, then canonicalized (lexicographically-smallest
+//! rotation, forward or reverse-complement) and scored against the whole
+//! read allowing both orientations, with a per-base match/mismatch/
+//! low-quality scoring scheme (see [`score_chunk`]). A period only reaches
+//! that scoring step once its raw literal match frequency
+//! ([`match_frequency_at_offset`]) clears [`MIN_UNIT_FREQUENCY`], and only
+//! survives once its final score clears [`MIN_IRR_SCORE`].
+//!
+//! Every period in `[motif_min_len, motif_max_len]` is evaluated
+//! independently against these two thresholds, and every canonical motif
+//! that passes is returned -- a read can plausibly satisfy more than one
+//! motif (e.g. a longer compound period that is itself a repetition of a
+//! shorter one also scores well), so this doesn't collapse to a single
+//! "best" period the way a greedy shortest-period search would.
 //!
 //! `bases` are expected to be uppercase decoded read sequence bytes (as
 //! returned by `rust_htslib::bam::record::Seq::as_bytes`), and `quals` are
 //! raw (non-ASCII-offset) PHRED scores (as returned by `Record::qual`).
 
-// const MIN_UNIT_FREQUENCY: f64 = 0.5;
+/// The raw (literal, position-by-position) match frequency a candidate
+/// period's offset must clear before its consensus repeat unit is even
+/// extracted and scored -- see [`match_frequency_at_offset`].
+const MIN_UNIT_FREQUENCY: f64 = 0.8;
+/// The final quality-aware match score (as a fraction of read length) a
+/// candidate motif must clear to be accepted -- see [`score_chunk`].
 const MIN_IRR_SCORE: f64 = 0.90;
+/// Below this PHRED quality, a mismatch is treated as an uncertain
+/// low-quality mismatch rather than a confident one -- see
+/// [`score_chunk`].
 const MIN_BASE_QUALITY: u8 = 20;
-
-/// The coverage fraction an IUPAC tier's best code must clear (see
-/// [`extract_consensus_base_iupac`]) to be called instead of escalating to
-/// a more degenerate tier. Ordinary sequencing error is normally well
-/// under 10%, so this comfortably tolerates noise while still catching a
-/// genuine, substantial minority allele (e.g. a true ~50/50 split).
-const MIN_BASE_PURITY: f64 = 0.9;
-
-/// Minimum number of real (A/C/G/T) observations a phase position needs
-/// before degenerate (IUPAC) calling is even attempted; below this, a
-/// handful of votes can't distinguish genuine ambiguity from small-sample
-/// noise, so [`extract_consensus_base_iupac`] falls back to plain majority
-/// vote.
-const MIN_DEGENERACY_SAMPLES: u32 = 8;
-
-/// IUPAC ambiguity codes grouped by degeneracy tier (fewest represented
-/// bases first), each paired with the literal bases it represents. Used by
-/// [`extract_consensus_base_iupac`] to find the smallest code that covers
-/// enough of the observed bases at a position.
-const IUPAC_TIERS: [&[(u8, &[u8])]; 4] = [
-    &[(b'A', b"A"), (b'C', b"C"), (b'G', b"G"), (b'T', b"T")],
-    &[
-        (b'R', b"AG"),
-        (b'Y', b"CT"),
-        (b'S', b"GC"),
-        (b'W', b"AT"),
-        (b'K', b"GT"),
-        (b'M', b"AC"),
-    ],
-    &[
-        (b'B', b"CGT"),
-        (b'D', b"AGT"),
-        (b'H', b"ACT"),
-        (b'V', b"ACG"),
-    ],
-    &[(b'N', b"ACGT")],
-];
-
-/// Does an observed literal base (`A`/`C`/`G`/`T`, or occasionally a
-/// sequencer no-call `N`) satisfy an IUPAC code from a repeat motif? A
-/// plain-letter code only matches itself; an ambiguity code matches any
-/// base in its represented set. Called once per base per candidate motif
-/// while scoring (see [`score_chunk`]), so this checks the fixed IUPAC
-/// alphabet directly rather than scanning [`IUPAC_TIERS`].
-fn iupac_matches(observed: u8, code: u8) -> bool {
-    if observed == code {
-        return true;
-    }
-    match code {
-        b'R' => matches!(observed, b'A' | b'G'),
-        b'Y' => matches!(observed, b'C' | b'T'),
-        b'S' => matches!(observed, b'G' | b'C'),
-        b'W' => matches!(observed, b'A' | b'T'),
-        b'K' => matches!(observed, b'G' | b'T'),
-        b'M' => matches!(observed, b'A' | b'C'),
-        b'B' => matches!(observed, b'C' | b'G' | b'T'),
-        b'D' => matches!(observed, b'A' | b'G' | b'T'),
-        b'H' => matches!(observed, b'A' | b'C' | b'T'),
-        b'V' => matches!(observed, b'A' | b'C' | b'G'),
-        b'N' => matches!(observed, b'A' | b'C' | b'G' | b'T'),
-        _ => false,
-    }
-}
 
 /// Default shortest repeat-unit (motif) length to consider.
 pub const DEFAULT_MOTIF_MIN_LEN: u32 = 2;
 /// Default longest repeat-unit (motif) length to consider.
 pub const DEFAULT_MOTIF_MAX_LEN: u32 = 20;
-/// Default degenerate-position cap for a mononucleotide (1bp) motif.
-pub const DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE: u32 = 0;
-/// Default degenerate-position cap for a dinucleotide (2bp) motif.
-pub const DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE: u32 = 0;
-/// Default degenerate-position cap for a trinucleotide (3bp) motif.
-pub const DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE: u32 = 1;
-/// Default degenerate-position cap for any motif of 4bp or longer.
-pub const DEFAULT_MAX_DEGENERATE_OTHER: u32 = 2;
-
-/// Length-tiered caps on how many IUPAC-ambiguous positions a motif may
-/// have before [`classify_in_repeat_read_all`] rejects it (see
-/// [`exceeds_degenerate_limit`]). Mononucleotide (1bp), dinucleotide (2bp),
-/// and trinucleotide (3bp) motifs are short enough that even one or two
-/// degenerate positions dominate the whole motif, so each gets its own,
-/// stricter cap; every motif of 4bp or longer shares `other`.
-#[derive(Debug, Clone, Copy)]
-pub struct DegenerateLimits {
-    pub mononucleotide: u32,
-    pub dinucleotide: u32,
-    pub trinucleotide: u32,
-    pub other: u32,
-}
-
-impl Default for DegenerateLimits {
-    fn default() -> Self {
-        Self {
-            mononucleotide: DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE,
-            dinucleotide: DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE,
-            trinucleotide: DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE,
-            other: DEFAULT_MAX_DEGENERATE_OTHER,
-        }
-    }
-}
-
-/// The number of `unit`'s positions that are an IUPAC ambiguity code
-/// rather than a plain A/C/G/T base.
-fn degenerate_count(unit: &[u8]) -> u32 {
-    unit.iter()
-        .filter(|&&b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
-        .count() as u32
-}
-
-/// Does `unit` have more degenerate positions than `limits` allows for its
-/// length?
-fn exceeds_degenerate_limit(unit: &[u8], limits: DegenerateLimits) -> bool {
-    let limit = match unit.len() {
-        1 => limits.mononucleotide,
-        2 => limits.dinucleotide,
-        3 => limits.trinucleotide,
-        _ => limits.other,
-    };
-    degenerate_count(unit) > limit
-}
 
 /// Returns every canonical repeat unit (motif) that independently clears
 /// both the unit-frequency and IRR-score thresholds for this read. A read
 /// can plausibly satisfy more than one motif (e.g. a longer compound period
 /// that is itself a repetition of a shorter one also scores well), so this
-/// doesn't collapse to a single "best" motif. Each returned motif is
-/// distinct; order is not significant. A motif may contain IUPAC ambiguity
-/// codes at consistently-mixed positions (see the module docs), but is
-/// excluded if it has more degenerate positions than `degenerate_limits`
-/// allows for its length (see [`exceeds_degenerate_limit`]).
+/// doesn't collapse to a single "best" motif (see the module docs). Each
+/// returned motif is distinct; order is not significant.
 pub fn identify_repeat_motifs(
     bases: &[u8],
     quals: &[u8],
     motif_min_len: u32,
     motif_max_len: u32,
-    degenerate_limits: DegenerateLimits,
 ) -> Vec<Vec<u8>> {
     let smallest_period = motif_min_len.max(1) as usize;
     let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
@@ -176,45 +70,47 @@ pub fn identify_repeat_motifs(
     // the score threshold never needs it at all.
     let mut bases_rc_cache: Option<(Vec<u8>, Vec<u8>)> = None;
 
-    let mut motifs: Vec<Vec<u8>> = Vec::new();
+    // At most one motif per candidate period, so this upper bound avoids
+    // any reallocation as `motifs` grows.
+    let mut motifs: Vec<Vec<u8>> =
+        Vec::with_capacity(largest_period.saturating_sub(smallest_period) + 1);
     for period in smallest_period..=largest_period {
-        // Commenting this out for now
-        // if match_frequency_at_offset(period, bases) < MIN_UNIT_FREQUENCY {
-        //     continue;
-        // }
+        if match_frequency_at_offset(period, bases) < MIN_UNIT_FREQUENCY {
+            continue;
+        }
 
-        let mut unit = extract_consensus_repeat_unit_iupac(period, bases, quals);
+        let mut unit = extract_consensus_repeat_unit(period, bases);
 
-        // Attempt to reduce the motif to a smaller period if one exists
+        // Attempt to reduce the motif to a smaller period if one exists,
+        // exactly matching a perfect (frequency == 1.0) repeat -- this
+        // reduction step always searches a fixed [1, 20] range, regardless
+        // of the caller's own motif length bounds.
         const PERFECT_MATCH_FREQUENCY: f64 = 1.0;
-        let (reduction_min, reduction_max) = (1, motif_max_len);
-        if let Some(reduced_period) =
-            smallest_frequent_period(PERFECT_MATCH_FREQUENCY, &unit, reduction_min, reduction_max)
-            && reduced_period != period
+        const REDUCTION_MIN_LEN: u32 = 1;
+        const REDUCTION_MAX_LEN: u32 = 20;
+        if let Some(reduced_period) = smallest_frequent_period(
+            PERFECT_MATCH_FREQUENCY,
+            &unit,
+            REDUCTION_MIN_LEN,
+            REDUCTION_MAX_LEN,
+        ) && reduced_period != period
         {
             unit = extract_consensus_repeat_unit(reduced_period, &unit);
         }
 
-        if unit.len() < motif_min_len as usize
-            || unit.len() > motif_max_len as usize
-            || exceeds_degenerate_limit(&unit, degenerate_limits)
-        {
+        if unit.len() < motif_min_len as usize || unit.len() > motif_max_len as usize {
             continue;
         }
 
         let canonical = compute_canonical_repeat_unit(&unit);
-        if canonical.is_empty() || motifs.contains(&canonical) {
+        // An empty or literal "N" unit (an all-no-call homopolymer) is
+        // never a meaningful repeat motif.
+        if canonical.is_empty() || canonical == b"N" || motifs.contains(&canonical) {
             continue;
         }
 
-        let unit_shifts = shift_unit(&canonical);
-        let forward_score = best_score_across_shifts(
-            &unit_shifts,
-            bases,
-            quals,
-            MIN_BASE_QUALITY,
-            early_exit_score,
-        );
+        let forward_score =
+            best_score_across_shifts(&canonical, bases, quals, MIN_BASE_QUALITY, early_exit_score);
         // The forward score alone already clears the threshold, so the
         // (comparatively expensive) reverse-complement orientation can't
         // change the accept/reject outcome -- skip computing it.
@@ -228,7 +124,7 @@ pub fn identify_repeat_motifs(
                 (bases_rc, quals_rc)
             });
             let reverse_score = best_score_across_shifts(
-                &unit_shifts,
+                &canonical,
                 bases_rc,
                 quals_rc,
                 MIN_BASE_QUALITY,
@@ -246,6 +142,7 @@ pub fn identify_repeat_motifs(
 
 // --- motif detection ---------------------------------------------------
 
+#[inline]
 fn max_matches_at_offset(offset: usize, bases: &[u8]) -> usize {
     bases.len().saturating_sub(offset)
 }
@@ -269,6 +166,8 @@ fn match_frequency_at_offset(offset: usize, bases: &[u8]) -> f64 {
 
 /// Finds the shortest motif period whose match frequency is at least as
 /// good as any longer period's, or `None` if none clears `min_frequency`.
+/// Used here only for the perfect-match period-reduction step (see
+/// [`identify_repeat_motifs`]).
 fn smallest_frequent_period(
     min_frequency: f64,
     bases: &[u8],
@@ -293,24 +192,27 @@ fn smallest_frequent_period(
 }
 
 /// Number of distinct letters [`ALPHABET_INDEX`] covers (`A`..=`Z`). Every
-/// byte [`extract_consensus_base`]/[`extract_consensus_base_iupac`] ever
-/// tally -- raw read bases (always `A`/`C`/`G`/`T`/`N`) and, during period
-/// reduction, a previously-computed consensus unit's bytes (which may be
-/// any of the 15 IUPAC letters) -- is an uppercase ASCII letter, so a
-/// 26-entry array covers every real input while costing far less to zero
-/// and scan per call than a full 256-entry one.
+/// byte [`extract_consensus_base`] ever tallies -- raw read bases (always
+/// `A`/`C`/`G`/`T`/`N`) and, during period reduction, a previously-computed
+/// consensus unit's bytes -- is an uppercase ASCII letter, so a 26-entry
+/// array covers every real input while costing far less to zero and scan
+/// per call than a full 256-entry one.
 const ALPHABET_SIZE: usize = 26;
 
 /// Vote-tally array index for an uppercase ASCII letter (see
 /// [`ALPHABET_SIZE`]).
+#[inline]
 fn alphabet_index(base: u8) -> usize {
     debug_assert!(
         base.is_ascii_uppercase(),
-        "expected an uppercase base/IUPAC-code byte, got {base}"
+        "expected an uppercase base byte, got {base}"
     );
     (base - b'A') as usize
 }
 
+/// Plain per-phase majority vote: the most frequently observed literal byte
+/// at this phase, quality-blind. Ties are broken deterministically by
+/// preferring the larger byte value.
 fn extract_consensus_base(offset: usize, period: usize, bases: &[u8]) -> u8 {
     let mut counts = [0u32; ALPHABET_SIZE];
     let mut index = offset;
@@ -319,9 +221,6 @@ fn extract_consensus_base(offset: usize, period: usize, bases: &[u8]) -> u8 {
         index += period;
     }
 
-    // Ties (equal counts) are broken deterministically by preferring the
-    // larger byte value (equivalently, the larger alphabet index, since
-    // the two are in the same order).
     counts
         .iter()
         .enumerate()
@@ -337,104 +236,35 @@ fn extract_consensus_repeat_unit(period: usize, bases: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Like [`extract_consensus_base`], but may call an IUPAC ambiguity code
-/// (see [`IUPAC_TIERS`]) instead of a single base, when a phase position is
-/// a genuine mix across repeat copies rather than one dominant base.
-///
-/// Two things guard against false ambiguity calls:
-/// - Only *confidently-called* bases (`quals[i] >= MIN_BASE_QUALITY`) count
-///   toward a tier's coverage, so an otherwise-clean position doesn't get
-///   marked ambiguous just because its noisy/low-quality observations
-///   happen to disagree -- that kind of noise is what the quality-aware
-///   scoring in [`score_chunk`] already exists to tolerate, not something
-///   the *motif* itself should absorb.
-/// - `period == 1` never escalates: a length-1 repeat unit is a homopolymer
-///   by definition, and an "ambiguous homopolymer" covering 2+ bases is
-///   nearly a wildcard -- it would happily paper over two unrelated
-///   same-length runs (e.g. `AAAAACCCCC`) as one fake "IRR" instead of
-///   correctly rejecting them as non-repetitive.
-///
-/// Below [`MIN_DEGENERACY_SAMPLES`] confident observations, or when no
-/// tier below `N` clears [`MIN_BASE_PURITY`], falls back to
-/// [`extract_consensus_base`] (i.e. today's plain majority vote, quality
-///-blind, over every observed base).
-fn extract_consensus_base_iupac(offset: usize, period: usize, bases: &[u8], quals: &[u8]) -> u8 {
-    if period >= 2 {
-        let mut hq_counts = [0u32; ALPHABET_SIZE];
-        let mut index = offset;
-        while index < bases.len() {
-            if quals[index] >= MIN_BASE_QUALITY {
-                hq_counts[alphabet_index(bases[index])] += 1;
-            }
-            index += period;
-        }
-
-        let acgt_total: u32 = [b'A', b'C', b'G', b'T']
-            .iter()
-            .map(|&b| hq_counts[alphabet_index(b)])
-            .sum();
-        if acgt_total >= MIN_DEGENERACY_SAMPLES {
-            for tier in IUPAC_TIERS {
-                let (code, covered) = tier
-                    .iter()
-                    .map(|&(code, members)| {
-                        (
-                            code,
-                            members
-                                .iter()
-                                .map(|&b| hq_counts[alphabet_index(b)])
-                                .sum::<u32>(),
-                        )
-                    })
-                    .max_by_key(|&(code, covered)| (covered, code))
-                    .expect("tiers are non-empty");
-                if covered as f64 / acgt_total as f64 >= MIN_BASE_PURITY {
-                    return code;
-                }
-            }
-        }
-    }
-
-    extract_consensus_base(offset, period, bases)
-}
-
-/// Like [`extract_consensus_repeat_unit`], but positions may come back as
-/// an IUPAC ambiguity code -- see [`extract_consensus_base_iupac`].
-fn extract_consensus_repeat_unit_iupac(period: usize, bases: &[u8], quals: &[u8]) -> Vec<u8> {
-    (0..period)
-        .map(|offset| extract_consensus_base_iupac(offset, period, bases, quals))
-        .collect()
+/// `unit` followed by a second copy of itself, so every cyclic rotation of
+/// `unit` is available as a `unit.len()`-wide window
+/// `doubled(unit)[offset..offset + unit.len()]` for `offset` in
+/// `0..unit.len()` -- one allocation shared across every rotation, instead
+/// of materializing each rotation as its own owned buffer.
+fn doubled(unit: &[u8]) -> Vec<u8> {
+    let mut doubled = unit.to_vec();
+    doubled.extend_from_slice(unit);
+    doubled
 }
 
 fn minimal_unit_under_shift(unit: &[u8]) -> Vec<u8> {
     let len = unit.len();
-    let mut doubled = unit.to_vec();
-    doubled.extend_from_slice(unit);
+    let doubled = doubled(unit);
     let best_offset = (0..len)
         .min_by_key(|&offset| &doubled[offset..offset + len])
         .unwrap_or(0);
     doubled[best_offset..best_offset + len].to_vec()
 }
 
-/// The IUPAC complement of a single base or ambiguity code: `A<->T`,
-/// `C<->G`, `R<->Y`, `K<->M`, `B<->V`, `D<->H`, and `S`/`W`/`N` (each
-/// self-complementary, since complementing every base in their represented
-/// set yields the same set back).
+/// `A<->T`, `C<->G`; anything else (including a sequencer no-call `N`)
+/// complements to `N`.
+#[inline]
 fn complement_base(base: u8) -> u8 {
     match base {
         b'A' => b'T',
         b'T' => b'A',
         b'C' => b'G',
         b'G' => b'C',
-        b'R' => b'Y',
-        b'Y' => b'R',
-        b'K' => b'M',
-        b'M' => b'K',
-        b'B' => b'V',
-        b'V' => b'B',
-        b'D' => b'H',
-        b'H' => b'D',
-        b'S' | b'W' | b'N' => base,
         _ => b'N',
     }
 }
@@ -460,23 +290,10 @@ fn compute_canonical_repeat_unit(unit: &[u8]) -> Vec<u8> {
 
 // --- quality-aware matching ----------------------------------------------
 
-/// Every cyclic rotation of `unit` (e.g. `"ATG"` -> `["ATG", "TGA", "GAT"]`),
-/// so a candidate motif can be scored against a read at every possible
-/// phase alignment (see [`best_score_across_shifts`]) -- the read's first
-/// base isn't necessarily the motif's first base.
-fn shift_unit(unit: &[u8]) -> Vec<Vec<u8>> {
-    let len = unit.len();
-    let mut doubled = unit.to_vec();
-    doubled.extend_from_slice(unit);
-    (0..len)
-        .map(|offset| doubled[offset..offset + len].to_vec())
-        .collect()
-}
-
-/// Scores one `unit`-length chunk against `unit`: +1 per IUPAC-matching
-/// position, -1 per confident mismatch, or +0.5 for a mismatch whose
-/// quality is below `min_baseq` (too uncertain to penalize as confidently
-/// wrong).
+/// Scores one `unit`-length chunk against `unit`: +1 per matching position,
+/// -1 per confident mismatch, or +0.5 for a mismatch whose quality is below
+/// `min_baseq` (too uncertain to penalize as confidently wrong).
+#[inline]
 fn score_chunk(unit: &[u8], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
     const MATCH_SCORE: f64 = 1.0;
     const LOWQUAL_MISMATCH_SCORE: f64 = 0.5;
@@ -487,7 +304,7 @@ fn score_chunk(unit: &[u8], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
         .zip(quals)
         .zip(unit)
         .map(|((&base, &qual), &unit_base)| {
-            if iupac_matches(base, unit_base) {
+            if base == unit_base {
                 MATCH_SCORE
             } else if qual < min_baseq {
                 LOWQUAL_MISMATCH_SCORE
@@ -509,21 +326,29 @@ fn score_repeat(unit: &[u8], bases: &[u8], quals: &[u8], min_baseq: u8) -> f64 {
         .sum()
 }
 
-/// The best [`score_repeat`] across every rotation in `unit_shifts` (see
-/// [`shift_unit`]), since the read's phase relative to the motif is
-/// unknown. Stops scanning further rotations as soon as the running best
-/// clears `early_exit_at` -- callers only ever compare this result against
-/// that same threshold, and once it's cleared, no later rotation (which can
-/// only raise, never lower, the running max) could change that outcome.
+/// The best [`score_repeat`] across every cyclic rotation of `unit` (e.g.
+/// `"ATG"` -> `"ATG"`, `"TGA"`, `"GAT"`), since the read's phase relative to
+/// the motif is unknown -- the read's first base isn't necessarily the
+/// motif's first base. Rotations are scored as `unit.len()`-wide windows
+/// into a single [`doubled`] copy of `unit` rather than each being
+/// materialized as its own owned buffer. Stops scanning further rotations
+/// as soon as the running best clears `early_exit_at` -- callers only ever
+/// compare this result against that same threshold, and once it's cleared,
+/// no later rotation (which can only raise, never lower, the running max)
+/// could change that outcome.
 fn best_score_across_shifts(
-    unit_shifts: &[Vec<u8>],
+    unit: &[u8],
     bases: &[u8],
     quals: &[u8],
     min_baseq: u8,
     early_exit_at: f64,
 ) -> f64 {
+    let len = unit.len();
+    let doubled = doubled(unit);
+
     let mut best = f64::NEG_INFINITY;
-    for shift in unit_shifts {
+    for offset in 0..len {
+        let shift = &doubled[offset..offset + len];
         let score = score_repeat(shift, bases, quals, min_baseq);
         if score > best {
             best = score;
@@ -538,23 +363,6 @@ fn best_score_across_shifts(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `classify_in_repeat_read_all` at the default degenerate-position
-    /// caps, for tests that don't care about that parameter specifically.
-    fn classify_all_default(
-        bases: &[u8],
-        quals: &[u8],
-        motif_min_len: u32,
-        motif_max_len: u32,
-    ) -> Vec<Vec<u8>> {
-        identify_repeat_motifs(
-            bases,
-            quals,
-            motif_min_len,
-            motif_max_len,
-            DegenerateLimits::default(),
-        )
-    }
 
     #[test]
     fn max_matches_at_offset_various() {
@@ -613,6 +421,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_consensus_base_majority_vote_ignores_minority() {
+        // 8 A's and 2 G's at the same phase: plain majority vote, no
+        // ambiguity calling, so this resolves to the outright majority (A)
+        // regardless of how confident/frequent the minority is.
+        let bases: Vec<u8> = (0..10).map(|i| if i < 8 { b'A' } else { b'G' }).collect();
+        assert_eq!(extract_consensus_base(0, 1, &bases), b'A');
+    }
+
+    #[test]
     fn extract_consensus_repeat_unit_basic() {
         assert_eq!(extract_consensus_repeat_unit(3, b"CGGCGGCGG"), b"CGG");
         assert_eq!(extract_consensus_repeat_unit(3, b"CGGATTATTATTCGG"), b"ATT");
@@ -635,299 +452,71 @@ mod tests {
     /// exact 21bp repeat unit also passes on its own -- so this read
     /// legitimately qualifies under two distinct, non-harmonic motifs
     /// (unlike a pure homopolymer, where every candidate period reduces
-    /// back to the same single-base canonical unit).
+    /// back to the same single-base canonical unit). Every other period
+    /// either reduces to the same "A" homopolymer (plain majority vote
+    /// always favors the dominant A, with no ambiguity calling to instead
+    /// flag it as a mixed position) or fails the raw frequency/score
+    /// thresholds outright, so this fixture's two motifs are the only ones
+    /// expected back.
     fn mostly_a_with_rare_g() -> Vec<u8> {
         let unit: Vec<u8> = (0..20).map(|_| b'A').chain(std::iter::once(b'G')).collect();
         unit.iter().cloned().cycle().take(21 * 16).collect()
     }
 
     #[test]
-    fn classify_in_repeat_read_all_returns_single_motif_for_pure_repeat() {
+    fn identify_repeat_motifs_returns_single_motif_for_pure_repeat() {
         let bases = "CAG".repeat(20).into_bytes();
         let quals = vec![40u8; bases.len()];
         assert_eq!(
-            classify_all_default(&bases, &quals, 1, 20),
+            identify_repeat_motifs(&bases, &quals, 1, 20),
             vec![b"AGC".to_vec()]
         );
     }
 
     #[test]
-    fn classify_in_repeat_read_all_returns_empty_for_non_repetitive() {
+    fn identify_repeat_motifs_returns_empty_for_non_repetitive() {
         let bases = b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA";
         let quals = vec![40u8; bases.len()];
-        assert!(classify_all_default(bases, &quals, 1, 20).is_empty());
+        assert!(identify_repeat_motifs(bases, &quals, 1, 20).is_empty());
     }
 
     #[test]
-    fn classify_in_repeat_read_all_returns_multiple_distinct_motifs() {
+    fn identify_repeat_motifs_returns_multiple_distinct_motifs() {
         let bases = mostly_a_with_rare_g();
         let quals = vec![40u8; bases.len()];
 
-        let motifs = classify_all_default(&bases, &quals, 1, 30);
-
-        assert!(
-            motifs.contains(&b"A".to_vec()),
-            "expected the mostly-A homopolymer motif to qualify: {motifs:?}"
-        );
-        assert!(
-            motifs.iter().any(|m| m.len() == 21),
-            "expected the exact 21bp repeat unit to also qualify: {motifs:?}"
-        );
-        // Not asserting an exact count: this fixture's rare-but-real G
-        // interruptions are confident (uniform high quality), so several
-        // *other* periods can also legitimately turn up a partially
-        // degenerate (R-containing) motif that independently clears the
-        // score threshold. That's expected now that degenerate calling
-        // exists -- this test only cares that the two motifs it names
-        // above are among whatever comes back.
-    }
-
-    // --- IUPAC degenerate-motif calling ---------------------------------
-
-    #[test]
-    fn iupac_matches_basic() {
-        assert!(iupac_matches(b'A', b'A'));
-        assert!(!iupac_matches(b'A', b'C'));
-
-        assert!(iupac_matches(b'A', b'R'));
-        assert!(iupac_matches(b'G', b'R'));
-        assert!(!iupac_matches(b'C', b'R'));
-        assert!(!iupac_matches(b'T', b'R'));
-
-        for base in [b'A', b'C', b'G', b'T'] {
-            assert!(iupac_matches(base, b'N'), "N should match {}", base as char);
-        }
-    }
-
-    #[test]
-    fn complement_base_iupac_pairs() {
-        assert_eq!(complement_base(b'A'), b'T');
-        assert_eq!(complement_base(b'T'), b'A');
-        assert_eq!(complement_base(b'C'), b'G');
-        assert_eq!(complement_base(b'G'), b'C');
-        assert_eq!(complement_base(b'R'), b'Y');
-        assert_eq!(complement_base(b'Y'), b'R');
-        assert_eq!(complement_base(b'K'), b'M');
-        assert_eq!(complement_base(b'M'), b'K');
-        assert_eq!(complement_base(b'B'), b'V');
-        assert_eq!(complement_base(b'V'), b'B');
-        assert_eq!(complement_base(b'D'), b'H');
-        assert_eq!(complement_base(b'H'), b'D');
-        // Self-complementary: complementing every base in the represented
-        // set yields the same set back.
-        assert_eq!(complement_base(b'S'), b'S');
-        assert_eq!(complement_base(b'W'), b'W');
-        assert_eq!(complement_base(b'N'), b'N');
-    }
-
-    #[test]
-    fn reverse_complement_handles_iupac_codes() {
-        assert_eq!(reverse_complement(b"GCN"), b"NGC");
-        assert_eq!(reverse_complement(b"AARRG"), b"CYYTT");
-    }
-
-    #[test]
-    fn extract_consensus_base_iupac_calls_ambiguity_code_for_genuine_mixture() {
-        // A period-2 unit where phase 0 evenly alternates A/G copy-to-copy
-        // (10 copies, well above the sample-size gate) while phase 1 stays
-        // pure C: phase 0 should resolve to R (A/G), not force one or the
-        // other.
-        let bases: Vec<u8> = (0..10)
-            .flat_map(|i| [if i % 2 == 0 { b'A' } else { b'G' }, b'C'])
-            .collect();
-        let quals = vec![40u8; bases.len()];
-
-        assert_eq!(extract_consensus_base_iupac(0, 2, &bases, &quals), b'R');
-        assert_eq!(extract_consensus_base_iupac(1, 2, &bases, &quals), b'C');
-    }
-
-    #[test]
-    fn extract_consensus_base_iupac_ignores_low_quality_votes() {
-        // Same 50/50 A/G mixture at phase 0, but every vote is low-quality:
-        // not enough *confident* observations to call ambiguity, so this
-        // falls back to the plain majority vote (tie broken toward the
-        // larger byte value, i.e. G), not R.
-        let bases: Vec<u8> = (0..10)
-            .flat_map(|i| [if i % 2 == 0 { b'A' } else { b'G' }, b'C'])
-            .collect();
-        let quals = vec![5u8; bases.len()];
-
-        assert_eq!(extract_consensus_base_iupac(0, 2, &bases, &quals), b'G');
-    }
-
-    #[test]
-    fn extract_consensus_base_iupac_never_escalates_at_period_one() {
-        // A clean, confident, well-sampled 50/50 A/G split -- but at
-        // period 1 (a homopolymer position) ambiguity calling must never
-        // trigger, regardless of sample size or quality.
-        let bases: Vec<u8> = (0..10).flat_map(|_| [b'A', b'G']).collect();
-        let quals = vec![40u8; bases.len()];
-
-        assert_eq!(extract_consensus_base_iupac(0, 1, &bases, &quals), b'G');
-    }
-
-    /// `extract_consensus_repeat_unit_iupac` is tested directly at a fixed
-    /// period below (like the plain `extract_consensus_repeat_unit_basic`
-    /// test above it), rather than through the full
-    /// `classify_in_repeat_read_all` pipeline: a position that's genuinely
-    /// unconstrained (as in a literal `GCN`) or split not-quite-evenly
-    /// (as in `AARRG`) measurably dilutes the *raw*, IUPAC-unaware
-    /// literal-byte periodicity signal that the outer period search relies
-    /// on -- correctly so, since from that check's point of view alone,
-    /// weak-to-nonexistent periodicity at one whole position out of a
-    /// short motif is genuinely weak evidence of any period at all. Real
-    /// reads carrying a true degenerate position are usually much longer
-    /// relative to one ambiguous slot than these minimal fixtures, so the
-    /// aggregate signal clears the period-detection bar fine in practice
-    /// (see `classify_in_repeat_read_all_returns_multiple_distinct_motifs`
-    /// above for an end-to-end example). These two tests instead isolate
-    /// exactly the new piece of logic: given a period, does the consensus
-    /// step correctly call each position?
-
-    #[test]
-    fn extract_consensus_repeat_unit_iupac_calls_gcn_style_motif() {
-        // A `GC` repeat whose 3rd position cycles evenly through all 4
-        // bases across repeat copies: no single base, pair, or triple
-        // covers enough of it, so it must resolve to the fully degenerate
-        // `N` code.
-        let third = [b'A', b'C', b'G', b'T'];
-        let bases: Vec<u8> = (0..40).flat_map(|i| [b'G', b'C', third[i % 4]]).collect();
-        let quals = vec![40u8; bases.len()];
+        let motifs = identify_repeat_motifs(&bases, &quals, 1, 30);
 
         assert_eq!(
-            extract_consensus_repeat_unit_iupac(3, &bases, &quals),
-            b"GCN"
+            motifs,
+            vec![
+                b"A".to_vec(),
+                (0..20u8)
+                    .map(|_| b'A')
+                    .chain(std::iter::once(b'G'))
+                    .collect()
+            ],
+            "expected exactly the mostly-A homopolymer motif and the exact 21bp repeat unit: \
+             {motifs:?}"
         );
     }
 
     #[test]
-    fn extract_consensus_repeat_unit_iupac_calls_aarrg_style_motif() {
-        // Positions 0, 1, 4 are always A, A, G; positions 2, 3 are an even
-        // (10/10), irregularly-ordered mix of A and G across repeat
-        // copies -- each should resolve to the purine ambiguity code `R`.
-        // (Irregular, not a clean alternation: alternating every copy is
-        // itself an exact period twice as long, which is a different,
-        // non-degenerate case already covered by the `ATAT`-collapses-to-
-        // `AT` reasoning elsewhere in this module.)
-        let purines: [u8; 20] = [
-            b'A', b'G', b'G', b'A', b'A', b'G', b'A', b'G', b'G', b'A', b'G', b'A', b'A', b'G',
-            b'A', b'G', b'G', b'A', b'G', b'A',
-        ];
-        let bases: Vec<u8> = purines
-            .iter()
-            .flat_map(|&p| [b'A', b'A', p, p, b'G'])
-            .collect();
+    fn identify_repeat_motifs_rejects_period_below_min_unit_frequency() {
+        // A read with no periodic structure at all: no candidate period's
+        // raw match frequency clears MIN_UNIT_FREQUENCY, so nothing is even
+        // scored.
+        let bases = b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA";
         let quals = vec![40u8; bases.len()];
-
-        assert_eq!(
-            extract_consensus_repeat_unit_iupac(5, &bases, &quals),
-            b"AARRG"
-        );
+        assert!(identify_repeat_motifs(bases, &quals, 1, 20).is_empty());
     }
 
     #[test]
-    fn degenerate_count_basic() {
-        assert_eq!(degenerate_count(b"AAATG"), 0);
-        assert_eq!(degenerate_count(b"GCN"), 1);
-        assert_eq!(degenerate_count(b"AARRG"), 2);
-        assert_eq!(degenerate_count(b"NNNN"), 4);
-    }
-
-    #[test]
-    fn exceeds_degenerate_limit_uses_length_specific_defaults() {
-        let defaults = |unit: &[u8]| exceeds_degenerate_limit(unit, DegenerateLimits::default());
-
-        // Mononucleotide (1bp): default cap 0.
-        assert!(
-            !defaults(b"A"),
-            "a clean mononucleotide motif should never be rejected"
-        );
-        assert!(
-            defaults(b"N"),
-            "any degenerate position should exceed the mononucleotide default of 0"
-        );
-
-        // Dinucleotide (2bp): default cap 0.
-        assert!(
-            !defaults(b"AC"),
-            "a clean dinucleotide motif should never be rejected"
-        );
-        assert!(
-            defaults(b"AR"),
-            "any degenerate position should exceed the dinucleotide default of 0"
-        );
-
-        // Trinucleotide (3bp): default cap 1.
-        assert!(
-            !defaults(b"GCN"),
-            "one degenerate position should be within the trinucleotide default of 1"
-        );
-        assert!(
-            defaults(b"RCN"),
-            "two degenerate positions should exceed the trinucleotide default of 1"
-        );
-
-        // Everything else (4bp+): default cap 2.
-        assert!(
-            !defaults(b"AARRG"),
-            "two degenerate positions should be within the \"other\" default of 2"
-        );
-        assert!(
-            defaults(b"ARRRG"),
-            "three degenerate positions should exceed the \"other\" default of 2"
-        );
-    }
-
-    /// An 8bp unit: 5 fixed A's, then 3 positions that mix evenly (10/10)
-    /// between A and G, cycling copy-to-copy through an `AAGG` pattern
-    /// (period 4 in copy-index, i.e. not aligned with the target period-8
-    /// grouping) -- keeping the raw literal periodicity signal strong
-    /// enough to be found (5/8 positions always match exactly, and the
-    /// 3 mixed positions still match at the adjacent-copy lag about half
-    /// the time) while pushing the resulting unit's degenerate count (3)
-    /// just over the default "other" cap of 2.
-    fn mostly_pure_with_three_mixed_positions() -> Vec<u8> {
-        let purine_cycle = [b'A', b'A', b'G', b'G'];
-        (0..20usize)
-            .flat_map(|i| {
-                let p = purine_cycle[i % 4];
-                [b'A', b'A', b'A', b'A', b'A', p, p, p]
-            })
-            .collect()
-    }
-
-    #[test]
-    fn classify_in_repeat_read_all_rejects_motif_over_default_degenerate_limit() {
-        let bases = mostly_pure_with_three_mixed_positions();
+    fn identify_repeat_motifs_rejects_literal_n_unit() {
+        // An all-no-call "read": every base is a sequencer no-call, so the
+        // consensus unit is literally "N" and must be rejected outright.
+        let bases = vec![b'N'; 60];
         let quals = vec![40u8; bases.len()];
-
-        let motifs = classify_all_default(&bases, &quals, 2, 10);
-        assert!(
-            !motifs.iter().any(|m| m.len() == 8),
-            "an 8bp motif with 3 degenerate positions should be rejected at the default \
-             \"other\" cap of 2: {motifs:?}"
-        );
-    }
-
-    #[test]
-    fn classify_in_repeat_read_all_allows_motif_under_relaxed_degenerate_limit() {
-        let bases = mostly_pure_with_three_mixed_positions();
-        let quals = vec![40u8; bases.len()];
-
-        let motifs = identify_repeat_motifs(
-            &bases,
-            &quals,
-            2,
-            10,
-            DegenerateLimits {
-                other: 3,
-                ..Default::default()
-            },
-        );
-        let eight_mer = motifs.iter().find(|m| m.len() == 8);
-        assert!(
-            eight_mer.is_some_and(|m| degenerate_count(m) == 3),
-            "expected the 3-degenerate 8bp motif to survive with a relaxed \"other\" cap of 3: {motifs:?}"
-        );
+        assert!(identify_repeat_motifs(&bases, &quals, 1, 20).is_empty());
     }
 }

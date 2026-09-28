@@ -48,23 +48,6 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = irr::DEFAULT_MOTIF_MAX_LEN)]
     pub motif_max_len: u32,
 
-    /// Maximum number of IUPAC-ambiguous (non-A/C/G/T) positions allowed in
-    /// a mononucleotide (1bp) motif; motifs exceeding this are rejected.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_MONONUCLEOTIDE)]
-    pub max_degenerate_mononucleotide: u32,
-
-    /// Same, for a dinucleotide (2bp) motif.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_DINUCLEOTIDE)]
-    pub max_degenerate_dinucleotide: u32,
-
-    /// Same, for a trinucleotide (3bp) motif.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_TRINUCLEOTIDE)]
-    pub max_degenerate_trinucleotide: u32,
-
-    /// Same, for any motif of 4bp or longer.
-    #[arg(long, default_value_t = irr::DEFAULT_MAX_DEGENERATE_OTHER)]
-    pub max_degenerate_other: u32,
-
     /// Merge anchor (mate) locations within this many bp of each other into
     /// one anchor region for `--summary`.
     #[arg(long, default_value_t = 500)]
@@ -118,10 +101,8 @@ pub enum OutputFormat {
 /// `--anchor-merge-distance` bp of each other -- with the anchored IRR
 /// support broken down by (canonical) motif. A read that qualifies under
 /// more than one motif is counted once in `irr_count` but once per motif
-/// in `motifs`, so the `motifs` values can sum to more than `irr_count`.
-/// A motif key may contain IUPAC ambiguity codes (e.g. `GCN`, `AARRG`) at
-/// positions that are consistently mixed across repeat copies; see
-/// `irr::classify_in_repeat_read_all`.
+/// in `motifs`, so the `motifs` values can sum to more than `irr_count`;
+/// see `irr::identify_repeat_motifs`.
 #[derive(Serialize, Debug)]
 struct AnchorRegionSummary {
     chrom: String,
@@ -207,13 +188,6 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         _ => None,
     };
 
-    let degenerate_limits = irr::DegenerateLimits {
-        mononucleotide: args.max_degenerate_mononucleotide,
-        dinucleotide: args.max_degenerate_dinucleotide,
-        trinucleotide: args.max_degenerate_trinucleotide,
-        other: args.max_degenerate_other,
-    };
-
     let mut candidate_keys: HashSet<(i32, i64, Vec<u8>, u16)> = HashSet::new();
     // Each surviving candidate's anchor (mate) location and every canonical
     // motif the candidate qualifies under, used to build the merged
@@ -249,7 +223,6 @@ pub fn run(args: ProfileArgs) -> Result<()> {
                 record.qual(),
                 args.motif_min_len,
                 args.motif_max_len,
-                degenerate_limits,
             );
             if motifs.is_empty() {
                 continue;

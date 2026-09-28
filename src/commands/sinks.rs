@@ -87,15 +87,6 @@ pub fn run(args: SinksArgs) -> Result<()> {
             .context("failed to set reader thread count")?;
     }
 
-    // Unlike `profile`, `sinks` never allows IUPAC-ambiguous positions in a
-    // motif -- only plain A/C/G/T repeat units count as IRR evidence here.
-    let degenerate_limits = irr::DegenerateLimits {
-        mononucleotide: 0,
-        dinucleotide: 0,
-        trinucleotide: 0,
-        other: 0,
-    };
-
     // Each IRR read's alignment span is filed under every motif it
     // qualifies under, so regions are only ever merged with other regions
     // of the *same* motif.
@@ -118,7 +109,6 @@ pub fn run(args: SinksArgs) -> Result<()> {
             record.qual(),
             args.motif_min_len,
             args.motif_max_len,
-            degenerate_limits,
         );
         if motifs.is_empty() {
             continue;
