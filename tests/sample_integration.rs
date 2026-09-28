@@ -124,16 +124,16 @@ fn sample_no_header_treats_every_line_as_data() {
 }
 
 #[test]
-fn sample_requests_more_lines_than_available_writes_them_all() {
+fn sample_errors_when_requesting_more_lines_than_available() {
     let input_path = scratch_path("small_in.tsv");
     let output_path = scratch_path("small_out.tsv");
     write_fixture(&input_path, Some("id\tvalue"), 3);
 
     // n = ceil(ln(0.05)/ln(0.5)) = 5, more than the 3 available data rows.
-    run(default_args(input_path, output_path.clone(), 0.95, 0.5)).unwrap();
+    let result = run(default_args(input_path, output_path.clone(), 0.95, 0.5));
 
-    let lines = read_lines(&output_path);
-    assert_eq!(lines.len(), 4, "expected header + all 3 available rows, got {}", lines.len());
+    assert!(result.is_err());
+    assert!(!output_path.exists(), "no output should be written when there aren't enough lines");
 }
 
 #[test]

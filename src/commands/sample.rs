@@ -13,6 +13,9 @@
 //! The header line (unless `--no-header`) is never counted toward `N` and
 //! is always copied to the output first; sampled data lines are written in
 //! their original file order, not the order they were drawn in.
+//!
+//! It is an error for the input to have fewer than `N` data lines: no
+//! output is written in that case.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write as IoWrite};
@@ -59,7 +62,9 @@ pub struct SampleArgs {
 
 /// `N = ceil(ln(1 - c) / ln(1 - p))`: the number of independent samples
 /// needed for at least confidence `c` of observing, at least once, an
-/// event with per-sample probability `p`.
+/// event with per-sample probability `p`. Computed via `ln_1p` (`ln(1+x)`)
+/// rather than `ln` directly, for better precision when `c` or `p` is close
+/// to zero.
 fn sample_size(confidence: f64, probability: f64) -> Result<usize> {
     if !(0.0..1.0).contains(&confidence) {
         bail!("--confidence must be in [0, 1), got {confidence}");
@@ -68,7 +73,7 @@ fn sample_size(confidence: f64, probability: f64) -> Result<usize> {
         bail!("--probability must be in (0, 1), got {probability}");
     }
 
-    let n = ((1.0 - confidence).ln() / (1.0 - probability).ln()).ceil();
+    let n = ((-confidence).ln_1p() / (-probability).ln_1p()).ceil();
     Ok(n as usize)
 }
 
@@ -119,9 +124,8 @@ pub fn run(args: SampleArgs) -> Result<()> {
     }
 
     if seen < n {
-        log::warn!(
-            "sample: requested {n} lines (c={}, p={}) but {:?} only has {seen} data line{}; \
-             writing all of them",
+        bail!(
+            "sample: requested {n} lines (c={}, p={}) but {:?} only has {seen} data line{}",
             args.confidence,
             args.probability,
             args.input,
