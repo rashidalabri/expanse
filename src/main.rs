@@ -18,6 +18,7 @@ fn main() {
         Commands::Profile(args) => commands::profile::run(args),
         Commands::Merge(args) => commands::merge::run(args),
         Commands::Sinks(args) => commands::sinks::run(args),
+        Commands::Sample(args) => commands::sample::run(args),
     };
 
     if let Err(err) = result {

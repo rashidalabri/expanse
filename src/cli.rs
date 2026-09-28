@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 use crate::commands::merge::MergeArgs;
 use crate::commands::profile::ProfileArgs;
+use crate::commands::sample::SampleArgs;
 use crate::commands::sinks::SinksArgs;
 
 #[derive(Parser, Debug)]
@@ -29,4 +30,9 @@ pub enum Commands {
     /// they cluster as a BED file, for use as a `profile --sink-bed` /
     /// `--exclude-bed` input.
     Sinks(SinksArgs),
+
+    /// Randomly sample lines from a line-delimited file, sized so that a
+    /// motif expansion occurring in a `--probability` fraction of samples
+    /// is seen at least once with `--confidence` confidence.
+    Sample(SampleArgs),
 }
