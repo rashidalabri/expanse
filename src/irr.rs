@@ -14,11 +14,13 @@
 //! survives once its final score clears [`MIN_IRR_SCORE`].
 //!
 //! Every period in `[motif_min_len, motif_max_len]` is evaluated
-//! independently against these two thresholds, and every canonical motif
-//! that passes is returned -- a read can plausibly satisfy more than one
-//! motif (e.g. a longer compound period that is itself a repetition of a
-//! shorter one also scores well), so this doesn't collapse to a single
-//! "best" period the way a greedy shortest-period search would.
+//! independently against these two thresholds. A read can plausibly
+//! satisfy more than one motif (e.g. a longer compound period that is
+//! itself a repetition of a shorter one also scores well), so this doesn't
+//! collapse to a single "best" period the way a greedy shortest-period
+//! search would -- [`identify_repeat_motifs`] returns every motif that
+//! passes, while [`best_repeat_motif`] picks the single highest-scoring
+//! one for callers that need to attribute a read to exactly one motif.
 //!
 //! `bases` are expected to be uppercase decoded read sequence bytes (as
 //! returned by `rust_htslib::bam::record::Seq::as_bytes`), and `quals` are
@@ -41,27 +43,43 @@ pub const DEFAULT_MOTIF_MIN_LEN: u32 = 2;
 /// Default longest repeat-unit (motif) length to consider.
 pub const DEFAULT_MOTIF_MAX_LEN: u32 = 20;
 
-/// Returns every canonical repeat unit (motif) that independently clears
-/// both the unit-frequency and IRR-score thresholds for this read. A read
-/// can plausibly satisfy more than one motif (e.g. a longer compound period
-/// that is itself a repetition of a shorter one also scores well), so this
-/// doesn't collapse to a single "best" motif (see the module docs). Each
-/// returned motif is distinct; order is not significant.
-pub fn identify_repeat_motifs(
+/// A canonical repeat unit that independently cleared both the
+/// unit-frequency and IRR-score thresholds for one candidate period (see
+/// [`motif_candidates`]), paired with its final quality-aware match score
+/// as a fraction of read length (`score / bases.len()`, the same quantity
+/// [`MIN_IRR_SCORE`] gates).
+struct MotifCandidate {
+    canonical: Vec<u8>,
+    score: f64,
+}
+
+/// Evaluates every period in `[motif_min_len, motif_max_len]` against the
+/// unit-frequency and IRR-score thresholds (see the module docs), yielding
+/// one [`MotifCandidate`] per period whose canonical repeat unit clears
+/// both. A read can plausibly satisfy more than one motif (e.g. a longer
+/// compound period that is itself a repetition of a shorter one also
+/// scores well), so this doesn't collapse to a single "best" candidate the
+/// way a greedy shortest-period search would -- see [`identify_repeat_motifs`]
+/// (which returns every candidate) and [`best_repeat_motif`] (which picks
+/// the highest-scoring one) for the two ways callers consume this. Results
+/// are deduplicated by canonical unit: a later period reducing to an
+/// already-seen canonical unit would only recompute the same score, so it's
+/// skipped rather than re-scored.
+fn motif_candidates(
     bases: &[u8],
     quals: &[u8],
     motif_min_len: u32,
     motif_max_len: u32,
-) -> Vec<Vec<u8>> {
+) -> Vec<MotifCandidate> {
     let smallest_period = motif_min_len.max(1) as usize;
     let largest_period = (motif_max_len as usize).min(bases.len() / 2 + 1);
     let bases_len = bases.len() as f64;
     // An internal short-circuit threshold only -- every per-motif accept/
     // reject decision below still uses the exact original `score /
     // bases_len >= MIN_IRR_SCORE` comparison, so this never changes which
-    // motifs come back (including the bases_len == 0 edge case, where this
-    // threshold is 0.0 but the real comparison's `0.0 / 0.0` is NaN and
-    // therefore never passes).
+    // candidates come back (including the bases_len == 0 edge case, where
+    // this threshold is 0.0 but the real comparison's `0.0 / 0.0` is NaN
+    // and therefore never passes).
     let early_exit_score = MIN_IRR_SCORE * bases_len;
 
     // The read's reverse complement doesn't depend on the candidate period,
@@ -70,9 +88,9 @@ pub fn identify_repeat_motifs(
     // the score threshold never needs it at all.
     let mut bases_rc_cache: Option<(Vec<u8>, Vec<u8>)> = None;
 
-    // At most one motif per candidate period, so this upper bound avoids
-    // any reallocation as `motifs` grows.
-    let mut motifs: Vec<Vec<u8>> =
+    // At most one candidate per period, so this upper bound avoids any
+    // reallocation as `candidates` grows.
+    let mut candidates: Vec<MotifCandidate> =
         Vec::with_capacity(largest_period.saturating_sub(smallest_period) + 1);
     for period in smallest_period..=largest_period {
         if match_frequency_at_offset(period, bases) < MIN_UNIT_FREQUENCY {
@@ -105,7 +123,10 @@ pub fn identify_repeat_motifs(
         let canonical = compute_canonical_repeat_unit(&unit);
         // An empty or literal "N" unit (an all-no-call homopolymer) is
         // never a meaningful repeat motif.
-        if canonical.is_empty() || canonical == b"N" || motifs.contains(&canonical) {
+        if canonical.is_empty()
+            || canonical == b"N"
+            || candidates.iter().any(|c| c.canonical == canonical)
+        {
             continue;
         }
 
@@ -132,12 +153,56 @@ pub fn identify_repeat_motifs(
             );
             forward_score.max(reverse_score)
         };
-        if score / bases_len >= MIN_IRR_SCORE {
-            motifs.push(canonical);
+        let score = score / bases_len;
+        if score >= MIN_IRR_SCORE {
+            candidates.push(MotifCandidate { canonical, score });
         }
     }
 
-    motifs
+    candidates
+}
+
+/// Returns every canonical repeat unit (motif) that independently clears
+/// both the unit-frequency and IRR-score thresholds for this read. A read
+/// can plausibly satisfy more than one motif (e.g. a longer compound period
+/// that is itself a repetition of a shorter one also scores well), so this
+/// doesn't collapse to a single "best" motif -- see [`best_repeat_motif`]
+/// for that. Each returned motif is distinct; order is not significant.
+pub fn identify_repeat_motifs(
+    bases: &[u8],
+    quals: &[u8],
+    motif_min_len: u32,
+    motif_max_len: u32,
+) -> Vec<Vec<u8>> {
+    motif_candidates(bases, quals, motif_min_len, motif_max_len)
+        .into_iter()
+        .map(|candidate| candidate.canonical)
+        .collect()
+}
+
+/// Returns the single highest-scoring canonical repeat unit (motif) for
+/// this read, or `None` if no candidate period clears both thresholds (see
+/// the module docs). Ties are broken toward the candidate found at the
+/// smallest period. Unlike [`identify_repeat_motifs`], which returns every
+/// qualifying motif, this collapses to one -- for callers (like `sinks`)
+/// that need to attribute each read to exactly one motif rather than
+/// double-counting it under every motif it happens to also satisfy.
+pub fn best_repeat_motif(
+    bases: &[u8],
+    quals: &[u8],
+    motif_min_len: u32,
+    motif_max_len: u32,
+) -> Option<Vec<u8>> {
+    let mut best: Option<MotifCandidate> = None;
+    for candidate in motif_candidates(bases, quals, motif_min_len, motif_max_len) {
+        if best
+            .as_ref()
+            .is_none_or(|best| candidate.score > best.score)
+        {
+            best = Some(candidate);
+        }
+    }
+    best.map(|candidate| candidate.canonical)
 }
 
 // --- motif detection ---------------------------------------------------
@@ -499,6 +564,40 @@ mod tests {
             "expected exactly the mostly-A homopolymer motif and the exact 21bp repeat unit: \
              {motifs:?}"
         );
+    }
+
+    #[test]
+    fn best_repeat_motif_matches_identify_repeat_motifs_for_pure_repeat() {
+        let bases = "CAG".repeat(20).into_bytes();
+        let quals = vec![40u8; bases.len()];
+        assert_eq!(
+            best_repeat_motif(&bases, &quals, 1, 20),
+            Some(b"AGC".to_vec())
+        );
+    }
+
+    #[test]
+    fn best_repeat_motif_returns_none_for_non_repetitive() {
+        let bases = b"ACGTTGCAACGGTTCAGTAGCTAGCATCGATCGTAGCTAGGCTAGCATCGTAGCTAGCA";
+        let quals = vec![40u8; bases.len()];
+        assert_eq!(best_repeat_motif(bases, &quals, 1, 20), None);
+    }
+
+    #[test]
+    fn best_repeat_motif_picks_the_higher_scoring_of_two_qualifying_motifs() {
+        // Both the "A" homopolymer and the exact 21bp repeat unit qualify
+        // (see `identify_repeat_motifs_returns_multiple_distinct_motifs`),
+        // but the 21bp unit is an exact match (score 1.0) while the
+        // homopolymer is diluted by the rare G interruptions (~0.90) -- so
+        // the 21bp unit should win.
+        let bases = mostly_a_with_rare_g();
+        let quals = vec![40u8; bases.len()];
+
+        let expected: Vec<u8> = (0..20u8)
+            .map(|_| b'A')
+            .chain(std::iter::once(b'G'))
+            .collect();
+        assert_eq!(best_repeat_motif(&bases, &quals, 1, 30), Some(expected));
     }
 
     #[test]

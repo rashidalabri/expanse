@@ -199,7 +199,11 @@ fn sinks_merges_overlapping_same_motif_reads_and_separates_others() {
     let bam_path = build_fixture_bam();
     let output_path = scratch_path("sinks.bed");
 
-    let args = default_args(bam_path.to_str().unwrap().to_string(), output_path.clone(), None);
+    let args = default_args(
+        bam_path.to_str().unwrap().to_string(),
+        output_path.clone(),
+        None,
+    );
     run(args).expect("sinks run should succeed");
 
     let cag_motif = canonical_motif(&cag_seq());
@@ -207,7 +211,12 @@ fn sinks_merges_overlapping_same_motif_reads_and_separates_others() {
     assert_ne!(cag_motif, gata_motif, "fixture motifs should be distinct");
 
     let rows = read_bed(&output_path);
-    assert_eq!(rows.len(), 3, "expected 3 output rows, got {:?}", rows_debug(&rows));
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected 3 output rows, got {:?}",
+        rows_debug(&rows)
+    );
 
     // The merged near-CAG cluster: cagNear1 [100,160) + cagNear2 [105,165).
     let near_cag = rows
@@ -240,7 +249,15 @@ fn sinks_merges_overlapping_same_motif_reads_and_separates_others() {
 
 fn rows_debug(rows: &[BedRow]) -> Vec<(String, i64, i64, String, usize)> {
     rows.iter()
-        .map(|r| (r.chrom.clone(), r.start, r.end, r.motif.clone(), r.irr_count))
+        .map(|r| {
+            (
+                r.chrom.clone(),
+                r.start,
+                r.end,
+                r.motif.clone(),
+                r.irr_count,
+            )
+        })
         .collect()
 }
 
@@ -249,7 +266,11 @@ fn sinks_merge_distance_bridges_distant_same_motif_regions() {
     let bam_path = build_fixture_bam();
     let output_path = scratch_path("sinks_merged.bed");
 
-    let mut args = default_args(bam_path.to_str().unwrap().to_string(), output_path.clone(), None);
+    let mut args = default_args(
+        bam_path.to_str().unwrap().to_string(),
+        output_path.clone(),
+        None,
+    );
     // cagNear cluster ends at 165; cagFar starts at 5000. A merge distance
     // that bridges the ~4835bp gap should fold all three CAG reads into one
     // region.
@@ -279,8 +300,65 @@ fn sinks_requires_reference_for_cram_input() {
     let args = default_args(cram_path.to_str().unwrap().to_string(), output_path, None);
     let result = run(args);
 
-    assert!(result.is_err(), "expected an error without --reference for CRAM input");
+    assert!(
+        result.is_err(),
+        "expected an error without --reference for CRAM input"
+    );
     assert!(result.unwrap_err().to_string().contains("--reference"));
+}
+
+/// A read whose composition is 20 A's followed by a single G, repeated:
+/// qualifies under both the "A" homopolymer motif and the exact 21bp
+/// repeat unit (see the equivalent fixture in `src/irr.rs`), but the 21bp
+/// unit's exact match (score 1.0) beats the homopolymer's diluted score
+/// (~0.90) -- so `sinks` should attribute the read to the 21bp motif only,
+/// not fan it out across both.
+fn mostly_a_with_rare_g_seq() -> Vec<u8> {
+    let unit: Vec<u8> = (0..20).map(|_| b'A').chain(std::iter::once(b'G')).collect();
+    unit.iter().cloned().cycle().take(21 * 16).collect()
+}
+
+#[test]
+fn sinks_attributes_a_multi_motif_read_to_its_single_best_motif() {
+    let bam_path = scratch_path("multi_motif_fixture.bam");
+    let header = fixture_header();
+    let seq = mostly_a_with_rare_g_seq();
+
+    {
+        let mut writer = Writer::from_path(&bam_path, &header, Format::Bam).unwrap();
+        writer
+            .write(&make_record("multiMotif", 0, 100, 10, PAIRED, &seq))
+            .unwrap();
+    }
+
+    let output_path = scratch_path("multi_motif.bed");
+    let mut args = default_args(
+        bam_path.to_str().unwrap().to_string(),
+        output_path.clone(),
+        None,
+    );
+    args.motif_min_len = 1;
+    args.motif_max_len = 30;
+    run(args).expect("sinks run should succeed");
+
+    let rows = read_bed(&output_path);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected the read to be attributed to a single motif, not fanned out across every \
+         qualifying one: {:?}",
+        rows_debug(&rows)
+    );
+    assert_eq!(rows[0].irr_count, 1);
+
+    let quals = vec![40u8; seq.len()];
+    let best_motif = expanse::irr::best_repeat_motif(&seq, &quals, 1, 30)
+        .expect("fixture should qualify under at least one motif");
+    assert_eq!(
+        rows[0].motif.as_bytes(),
+        best_motif.as_slice(),
+        "expected the read attributed to its single best-scoring motif"
+    );
 }
 
 #[test]

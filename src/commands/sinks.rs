@@ -3,9 +3,9 @@
 //! motif -- and reports where they cluster, as a BED file: each row is a
 //! same-motif group of IRR-read alignment spans merged within
 //! `--merge-distance` bp of each other, with that motif and the number of
-//! IRR reads contributing to it. Regions are merged separately per motif,
-//! so the same coordinates can appear on more than one row if reads there
-//! qualify under more than one motif.
+//! IRR reads contributing to it. Each IRR read is attributed to its single
+//! best-scoring motif (see `irr::best_repeat_motif`), not every motif it
+//! happens to also satisfy, so it contributes to at most one row.
 //!
 //! Intended to build a `--sink-bed` / `--exclude-bed` input for `profile`:
 //! loci that are themselves saturated with IRRs are exactly the ones whose
@@ -67,7 +67,10 @@ pub struct SinksArgs {
 
 pub fn run(args: SinksArgs) -> Result<()> {
     if is_cram_path(&args.input) && args.reference.is_none() {
-        bail!("--reference is required when the input is CRAM (input={})", args.input);
+        bail!(
+            "--reference is required when the input is CRAM (input={})",
+            args.input
+        );
     }
 
     let mut reader = match Url::parse(&args.input) {
@@ -87,9 +90,9 @@ pub fn run(args: SinksArgs) -> Result<()> {
             .context("failed to set reader thread count")?;
     }
 
-    // Each IRR read's alignment span is filed under every motif it
-    // qualifies under, so regions are only ever merged with other regions
-    // of the *same* motif.
+    // Each IRR read's alignment span is filed under its single
+    // best-scoring motif only, so regions are only ever merged with other
+    // regions of the *same* motif.
     let mut regions_by_motif: HashMap<Vec<u8>, Vec<Region>> = HashMap::new();
     let mut scanned_count: u64 = 0;
     let mut irr_count: u64 = 0;
@@ -104,15 +107,14 @@ pub fn run(args: SinksArgs) -> Result<()> {
         if record.mapq() > args.max_irr_mapq {
             continue;
         }
-        let motifs = irr::identify_repeat_motifs(
+        let Some(motif) = irr::best_repeat_motif(
             &record.seq().as_bytes(),
             record.qual(),
             args.motif_min_len,
             args.motif_max_len,
-        );
-        if motifs.is_empty() {
+        ) else {
             continue;
-        }
+        };
         irr_count += 1;
 
         let region = Region {
@@ -120,9 +122,7 @@ pub fn run(args: SinksArgs) -> Result<()> {
             start: record.pos(),
             end: record.cigar().end_pos(),
         };
-        for motif in motifs {
-            regions_by_motif.entry(motif).or_default().push(region);
-        }
+        regions_by_motif.entry(motif).or_default().push(region);
     }
 
     // Merged (region, motif, irr_count) rows, one per same-motif cluster;
