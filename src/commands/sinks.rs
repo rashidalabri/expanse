@@ -7,6 +7,27 @@
 //! best-scoring motif (see `irr::best_repeat_motif`), not every motif it
 //! happens to also satisfy, so it contributes to at most one row.
 //!
+//! An IRR read is only counted if it pairs with a mapped mate whose MAPQ
+//! clears `--min-anchor-mapq` (an "anchored IRR pair") or whose mate is
+//! itself an IRR ("paired IRRs" -- both reads counted); an IRR read whose
+//! mate is neither is dropped. A read is an IRR candidate if it's unmapped
+//! *or* its MAPQ clears `--max-irr-mapq` -- reads entirely consumed by a
+//! long repeat often fail to map at all, not just map with low confidence
+//! -- so a paired IRR's mate may itself be unmapped, as long as it still
+//! independently qualifies via its motif content. An anchor, in contrast,
+//! must be mapped by definition; an anchored pair whose IRR side happens to
+//! be unmapped is still correctly recognized as anchored, but contributes
+//! no output row, since `sinks` only ever reports an IRR read's own
+//! position and an unmapped read has none.
+//!
+//! Pairing is resolved in a single pass over the file: every
+//! non-secondary/non-supplementary read is classified (IRR candidate,
+//! anchor, or neither) and, the first time either mate of a pair is seen,
+//! cached by qname until its mate is read; the pair is resolved the moment
+//! the second mate arrives, and both cache entries are dropped
+//! immediately, so memory stays proportional to how many mate pairs are
+//! simultaneously "in flight" in the file, not to the file's total size.
+//!
 //! Intended to build a `--sink-bed` / `--exclude-bed` input for `profile`:
 //! loci that are themselves saturated with IRRs are exactly the ones whose
 //! anchor-mate evidence isn't informative and should be excluded from its
@@ -38,9 +59,17 @@ pub struct SinksArgs {
     #[arg(short = 'o', long)]
     pub output: PathBuf,
 
-    /// Reads with MAPQ below this are candidates for IRR classification.
+    /// Reads with MAPQ at or below this, or unmapped entirely, are
+    /// candidates for IRR classification.
     #[arg(long, default_value_t = 40)]
     pub max_irr_mapq: u8,
+
+    /// Minimum MAPQ for a mapped mate to count as an anchor. An IRR
+    /// candidate is only counted if its mate clears this MAPQ (an
+    /// "anchored IRR pair") or is itself an IRR ("paired IRRs"); an IRR
+    /// candidate whose mate is neither is dropped.
+    #[arg(long, default_value_t = 50)]
+    pub min_anchor_mapq: u8,
 
     /// Shortest repeat-unit (motif) length considered when checking whether
     /// a candidate read is an in-repeat read (IRR).
@@ -63,6 +92,19 @@ pub struct SinksArgs {
     /// Number of htslib I/O threads to use for reading.
     #[arg(long, default_value_t = 1)]
     pub threads: usize,
+}
+
+/// A read's role for IRR/anchor pairing (see [`run`]): either a high-MAPQ
+/// anchor, or an IRR candidate with its best-scoring motif and, if mapped,
+/// its own alignment span (`None` for an unmapped IRR read, which has no
+/// position to report). Cached by qname until its mate is seen, so a pair
+/// can be resolved the moment both members have been read once each.
+enum Classification {
+    Anchor,
+    Irr {
+        motif: Vec<u8>,
+        region: Option<Region>,
+    },
 }
 
 pub fn run(args: SinksArgs) -> Result<()> {
@@ -90,40 +132,104 @@ pub fn run(args: SinksArgs) -> Result<()> {
             .context("failed to set reader thread count")?;
     }
 
-    // Each IRR read's alignment span is filed under its single
+    // Each counted IRR read's alignment span is filed under its single
     // best-scoring motif only, so regions are only ever merged with other
     // regions of the *same* motif.
     let mut regions_by_motif: HashMap<Vec<u8>, Vec<Region>> = HashMap::new();
+    // Reads seen so far whose mate hasn't been reached yet, keyed by
+    // qname; resolved (and removed) the moment their mate is read. See the
+    // module docs for why this stays small in practice despite having no
+    // explicit eviction.
+    let mut pending: HashMap<Vec<u8>, Classification> = HashMap::new();
     let mut scanned_count: u64 = 0;
-    let mut irr_count: u64 = 0;
+    let mut anchored_irr_count: u64 = 0;
+    let mut paired_irr_count: u64 = 0;
     let mut record = Record::new();
     while let Some(result) = reader.read(&mut record) {
         result.context("failed to read record")?;
         scanned_count += 1;
 
-        if record.is_unmapped() || record.is_secondary() || record.is_supplementary() {
+        if record.is_secondary() || record.is_supplementary() {
             continue;
         }
-        if record.mapq() > args.max_irr_mapq {
-            continue;
-        }
-        let Some(motif) = irr::best_repeat_motif(
-            &record.seq().as_bytes(),
-            record.qual(),
-            args.motif_min_len,
-            args.motif_max_len,
-        ) else {
-            continue;
-        };
-        irr_count += 1;
 
-        let region = Region {
-            tid: record.tid(),
-            start: record.pos(),
-            end: record.cigar().end_pos(),
+        let mapq = record.mapq();
+        // A read entirely consumed by a long repeat often fails to map at
+        // all, not just map with low confidence, so an unmapped read is
+        // always an IRR candidate regardless of its (otherwise
+        // meaningless) MAPQ -- matching the low-MAPQ gate below with `||`.
+        let classification = if record.is_unmapped() || mapq <= args.max_irr_mapq {
+            let Some(motif) = irr::best_repeat_motif(
+                &record.seq().as_bytes(),
+                record.qual(),
+                args.motif_min_len,
+                args.motif_max_len,
+            ) else {
+                continue;
+            };
+            let region = (!record.is_unmapped()).then(|| Region {
+                tid: record.tid(),
+                start: record.pos(),
+                end: record.cigar().end_pos(),
+            });
+            Classification::Irr { motif, region }
+        } else if mapq >= args.min_anchor_mapq {
+            Classification::Anchor
+        } else {
+            continue;
         };
-        regions_by_motif.entry(motif).or_default().push(region);
+
+        match (pending.remove(record.qname()), classification) {
+            (
+                Some(Classification::Irr { motif, region }),
+                Classification::Irr {
+                    motif: mate_motif,
+                    region: mate_region,
+                },
+            ) => {
+                // Paired IRRs: each side that has a real alignment
+                // position contributes its own region -- an unmapped IRR
+                // read has none, but still validly pairs with (and
+                // confirms) its mate.
+                if let Some(region) = region {
+                    regions_by_motif.entry(motif).or_default().push(region);
+                    paired_irr_count += 1;
+                }
+                if let Some(mate_region) = mate_region {
+                    regions_by_motif
+                        .entry(mate_motif)
+                        .or_default()
+                        .push(mate_region);
+                    paired_irr_count += 1;
+                }
+            }
+            (Some(Classification::Irr { motif, region }), Classification::Anchor)
+            | (Some(Classification::Anchor), Classification::Irr { motif, region }) => {
+                // Anchored IRR pair: only the IRR side has a locus to
+                // report -- if it's unmapped, there's nothing to push, but
+                // the pairing is still resolved (both cache entries
+                // consumed).
+                if let Some(region) = region {
+                    regions_by_motif.entry(motif).or_default().push(region);
+                    anchored_irr_count += 1;
+                }
+            }
+            (Some(Classification::Anchor), Classification::Anchor) => {
+                // Neither read is an IRR: nothing to count.
+            }
+            (None, classification) => {
+                pending.insert(record.qname().to_vec(), classification);
+            }
+        }
     }
+    // Any reads still pending never had their mate resolved in this scan
+    // (e.g. the mate was itself dropped -- neither an IRR candidate nor
+    // anchor-tier), so they were never anchored or paired; purely
+    // informational for the log message below.
+    let unresolved_count = pending.len() as u64;
+    drop(pending);
+
+    let irr_count = anchored_irr_count + paired_irr_count;
 
     // Merged (region, motif, irr_count) rows, one per same-motif cluster;
     // sorted below for deterministic BED output.
@@ -173,8 +279,9 @@ pub fn run(args: SinksArgs) -> Result<()> {
         .with_context(|| format!("failed to flush output BED {:?}", args.output))?;
 
     log::info!(
-        "sinks: {scanned_count} records scanned, {irr_count} IRR reads found, {} merged regions \
-         written to {:?}",
+        "sinks: {scanned_count} records scanned, {irr_count} IRR reads counted \
+         ({anchored_irr_count} anchored, {paired_irr_count} paired, {unresolved_count} \
+         unresolved mates dropped), {} merged regions written to {:?}",
         output_rows.len(),
         args.output,
     );
